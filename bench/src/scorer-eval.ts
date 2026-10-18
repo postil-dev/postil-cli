@@ -8,9 +8,10 @@
 
 import { execFile as execFileCb } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { cases as fixtureInputs } from "../fixtures/cases";
@@ -42,6 +43,9 @@ import {
   type QualificationPair,
 } from "./livemodels-score";
 import {
+  assertEvaluatorRuntime,
+  resolveBinaryQualificationMetadata,
+  resolveQualificationSourceAuthority,
   fetchPricing as fetchQualificationPricing,
   normalizeApiBase,
   qualificationCandidateDocument,
@@ -194,6 +198,7 @@ interface ScorerPhaseDiagnostics {
 }
 
 export interface ScorerCaseDiagnostics {
+  adjudicationOutput?: AdjudicationOutput;
   childExitCode: number | null;
   requiredUpstreamAttempts: 2;
   adjudication: ScorerPhaseDiagnostics;
@@ -208,6 +213,101 @@ export interface ScorerCaseDiagnostics {
 
 export const SCORER_DIAGNOSTIC_RESPONSE_LIMIT = 32;
 const SCORER_DIAGNOSTIC_ERROR_CODE_LIMIT = 8;
+
+// Canonical compact JSON is part of this internal wire contract. Re-encoding the
+// validated primitives also rejects duplicate keys, alternate escapes and members.
+export const ADJUDICATION_OUTPUT_PREFIX = "postil: adjudication-output ";
+const OUTPUT_FIELDS = ["candidateId", "status", "revisedTitle", "revisedBody", "evidence",
+  "duplicateOf", "scope", "disposition", "cause", "reason", "path", "side", "line",
+  "byteOffset", "diffLine", "corpusSha256", "other"] as const;
+const OUTPUT_CODES = {
+  callStarted: { chatTerminal: ["started"] },
+  attemptRejected: {
+    endpointErrorContract: ["endpointMalformed", "nonterminalStop"],
+    endpointContent: ["endpointMalformed", "missingChoices", "emptyContent", "nonterminalStop", "identityMissing", "identityMismatch"],
+  },
+  callFailed: { chatTerminal: ["endpointMalformed", "missingChoices", "emptyContent", "nonterminalStop", "identityMissing", "identityMismatch", "contextExceeded", "providerFailure", "timeout", "deadline", "otherChatFailure"] },
+  parserRejected: {
+    arrayExtraction: ["noArray", "unclosedArray"],
+    resultDeserialization: ["jsonSyntax", "jsonEof", "unexpectedIo", "missingKnownField", "unknownField", "duplicateKnownField", "invalidEnum", "wrongType", "otherData"],
+    resultCount: ["resultCountMismatch"],
+  },
+  parsed: { resultCount: ["accepted"] },
+} as const;
+type OutputCount = number | "overflow" | null;
+export interface AdjudicationOutputRecord {
+  attempt: number | null; // Local to this adjudication call, never a proxy ordinal.
+  call: 1; // One adjudication call per review child; not a proxy ordinal.
+  code: string;
+  event: keyof typeof OUTPUT_CODES;
+  expected: OutputCount;
+  field: typeof OUTPUT_FIELDS[number] | null;
+  finish: "stop" | "length" | "tool_calls" | "content_filter" | "error" | "reported" | "absent" | "end_turn" | "stop_sequence" | null;
+  observed: OutputCount;
+  phase: "adjudication";
+  stage: string;
+  version: 1;
+}
+interface AdjudicationOutput {
+  records: AdjudicationOutputRecord[];
+  malformed: number;
+  duplicates: number;
+  omitted: number;
+}
+
+export function adjudicationOutput(stderr: string): AdjudicationOutput | undefined {
+  const records: AdjudicationOutputRecord[] = [];
+  let malformed = 0;
+  let duplicates = 0;
+  const accepted = new Set<string>();
+  let omitted = 0;
+  let seen = 0;
+  const boundedIncrement = (value: number) => Math.min(65535, value + 1);
+  const ordinal = (value: unknown, max: number) => value === null ||
+    (typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= max);
+  const count = (value: unknown): value is OutputCount => value === null || value === "overflow" ||
+    (typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 20);
+  // Ordered records intentionally bypass the legacy Set used for coarse signals.
+  for (const line of stderr.split(/\r?\n/u)) {
+    if (!line.startsWith(ADJUDICATION_OUTPUT_PREFIX)) continue;
+    if (++seen > SCORER_DIAGNOSTIC_RESPONSE_LIMIT) { omitted = boundedIncrement(omitted); continue; }
+    const raw = line.slice(ADJUDICATION_OUTPUT_PREFIX.length);
+    if (Buffer.byteLength(line, "utf8") > 512) { malformed = boundedIncrement(malformed); continue; }
+    try {
+      const value = JSON.parse(raw);
+      if (!value || typeof value !== "object" || Array.isArray(value)) throw 0;
+      const { attempt, call, code, event, expected, field, finish, observed, phase, stage, version } = value;
+      if (version !== 1 || phase !== "adjudication" || !Object.hasOwn(OUTPUT_CODES, event) ||
+        call !== 1 || !ordinal(attempt, 13) || !count(expected) || !count(observed) ||
+        !(field === null || OUTPUT_FIELDS.includes(field)) ||
+        !(finish === null || ["stop", "length", "tool_calls", "content_filter", "error", "reported", "absent", "end_turn", "stop_sequence"].includes(finish))) throw 0;
+      const stages = OUTPUT_CODES[event as keyof typeof OUTPUT_CODES] as Record<string, readonly string[]>;
+      if (!Object.hasOwn(stages, stage) || !stages[stage]!.includes(code)) throw 0;
+      if ((event === "attemptRejected") !== (attempt !== null)) throw 0;
+      if (event !== "parserRejected" && event !== "parsed" && (expected !== null || observed !== null)) throw 0;
+      if (stage !== "resultDeserialization" && field !== null) throw 0;
+      if (stage === "resultDeserialization") {
+        if (field === null) throw 0;
+        if (["missingKnownField", "duplicateKnownField"].includes(code)) {
+          if (field === "other") throw 0;
+        } else if (code === "invalidEnum" ? field !== "status" : field !== "other") throw 0;
+      }
+      if (event === "parserRejected" || event === "parsed") {
+        if (expected === null || (stage === "resultCount" ? observed === null : observed !== null)) throw 0;
+      }
+      if (code !== "nonterminalStop" && finish !== null) throw 0;
+      if (code === "nonterminalStop" && finish === null) throw 0;
+      const record: AdjudicationOutputRecord = {
+        attempt, call, code, event, expected, field, finish, observed, phase, stage, version,
+      };
+      if (JSON.stringify(record) !== raw) throw 0;
+      if (accepted.has(raw)) duplicates = boundedIncrement(duplicates);
+      accepted.add(raw);
+      records.push(record);
+    } catch { malformed = boundedIncrement(malformed); }
+  }
+  return seen === 0 ? undefined : { records, malformed, duplicates, omitted };
+}
 
 interface ScorerResponseMetadata {
   jsonShape: "object" | "other" | "invalid" | "unobserved";
@@ -359,6 +459,7 @@ export function scorerCaseDiagnostics(input: {
     };
   };
   return {
+    adjudicationOutput: adjudicationOutput(input.child.stderr),
     childExitCode: input.child.exitCode ?? null,
     requiredUpstreamAttempts: 2,
     adjudication: phaseCounts("adjudication"),
@@ -644,11 +745,10 @@ export function scorerEvaluatorDigest(
   return hash.digest("hex");
 }
 
-async function scorerEvalSourceAuthority(): Promise<{
+async function scorerEvalSourceAuthority(repositoryRoot = resolve(import.meta.dir, "..", "..")): Promise<{
   qualificationSourceSha: string;
   evaluatorSha256: string;
 }> {
-  const repositoryRoot = resolve(import.meta.dir, "..", "..");
   const gitOptions = { cwd: repositoryRoot, timeout: 15_000 };
   const [{ stdout: sourceOutput }, { stdout: trackedOutput }] = await Promise.all([
     execFile("git", ["rev-parse", "--verify", "HEAD^{commit}"], gitOptions),
@@ -971,6 +1071,81 @@ function evalCase(
   const c = fixtures.find((candidate) => candidate.id === id);
   if (!c) throw new Error(`unknown fixture ${id}`);
   return { case: c, scenario };
+}
+
+// A single diagnostic is deliberately separate from formal matrix admission.
+// The caller supplies immutable expected identities; no raw child artifact is
+// returned. This function does not select a different model, route or timeout.
+export async function assertScorerDiagnosticCustody(input: {
+  repositoryRoot: string; binary: string; sourceSha: string;
+  evaluatorSha256: string; cliBinarySha256: string;
+}) {
+  const gitOptions = { cwd: input.repositoryRoot, timeout: 15_000 };
+  const { stdout: status } = await execFile("git", ["status", "--porcelain=v1", "--untracked-files=all"], gitOptions);
+  assertCleanScorerEvaluatorStatus(status);
+  const authority = await scorerEvalSourceAuthority(input.repositoryRoot);
+  const source = await resolveQualificationSourceAuthority(input.repositoryRoot);
+  const runtime = await assertEvaluatorRuntime(input.repositoryRoot);
+  const binaryHash = await sha256File(input.binary);
+  if (source.sourceSha !== input.sourceSha || authority.qualificationSourceSha !== input.sourceSha ||
+    authority.evaluatorSha256 !== input.evaluatorSha256 || binaryHash !== input.cliBinarySha256) {
+    throw new Error("diagnostic custody identity mismatch");
+  }
+  const metadata = await resolveBinaryQualificationMetadata(input.binary);
+  for (const [actual, expected] of [
+    [metadata.modelDefaultsSha256, source.configHash],
+    [metadata.reviewContractSha256, source.reviewContractHash],
+    [metadata.fixtureSetSha256, source.fixtureHash],
+    [metadata.evaluatorContractSha256, source.evaluatorContractHash],
+    [metadata.evaluatorRuntimeIdentity, runtime],
+    [metadata.defaultApiBase, normalizeApiBase(DEFAULT_API_BASE)],
+    [metadata.defaultApiFormat, "openai-compatible"],
+  ]) {
+    if (actual !== expected) throw new Error("diagnostic binary contract mismatch");
+  }
+  return { ...authority, ...source, cliBinarySha256: binaryHash, evaluatorRuntimeIdentity: runtime };
+}
+
+export async function runScorerDiagnostic(input: {
+  binary: string; sourceSha: string; evaluatorSha256: string;
+  cliBinarySha256: string; keyName: string;
+}) {
+  const custodyInput = { ...input, repositoryRoot: resolve(import.meta.dir, "..", "..") };
+  const custody = await assertScorerDiagnosticCustody(custodyInput);
+  const embedded = await loadEmbeddedScorerDefaults();
+  if (!embedded.enabled || embedded.qualification_candidates.length !== 1) {
+    throw new Error("diagnostic requires the unchanged single embedded scorer candidate");
+  }
+  const model = embedded.qualification_candidates[0]!;
+  const c = selectEvalCases(fixtureInputs.map((value) => benchmarkCase.parse(value)))
+    .find((value) => value.case.id === "clean-comment-only" && value.scenario === "falseFinding")?.case;
+  if (!c || !FALSE_FINDING_CASES.includes(c.id)) throw new Error("diagnostic public fixture is unavailable");
+  if (!process.env[input.keyName]) throw new Error("diagnostic credential is unavailable");
+  const provider = "Azure";
+  const route = "azure/us";
+  const pricing = await fetchQualificationPricing(DEFAULT_API_BASE, "openai-compatible",
+    scorerQualificationModels([model]), provider, scorerQualificationRequiredParameters([model], provider), route);
+  assertQualificationPreflight([model], 1, pricing);
+  const providerContract = providerContractEvidence(provider, route, pricing, [GENERATOR_MODEL], [model]);
+  // mkdtemp owns this root. runScorerEvalCase may remove only its derived child.
+  const root = await mkdtemp(join(tmpdir(), "postil-scorer-diagnostic-"));
+  try {
+    const result = await runScorerEvalCase(c, "falseFinding", model, 1, input.binary, root,
+      DEFAULT_API_BASE, input.keyName, pricing.get(model) ?? null, SCORER_CASE_EXEC_TIMEOUT_MS,
+      provider, pricing.get(GENERATOR_MODEL) ?? null, route);
+    await assertScorerDiagnosticCustody(custodyInput);
+    return {
+      version: 1 as const, diagnosticOnly: true as const, matrixComplete: false as const,
+      custody, providerContract, providerContractSha256: providerContractSha256(providerContract),
+      fixture: c.id, scenario: "falseFinding" as const, repeat: 1 as const,
+      upstreamTimeoutMs: SCORER_PROXY_UPSTREAM_TIMEOUT_MS, childTimeoutMs: SCORER_CASE_EXEC_TIMEOUT_MS,
+      envelopeProduced: result.envelopeProduced, findingPublished: result.findingPublished,
+      gateFailing: result.gateFailing, scorerConfidence: result.scorerConfidence,
+      publicationValid: result.publicationValid, diagnostics: result.diagnostics,
+    };
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 }
 
 export async function runScorerEvalCase(
