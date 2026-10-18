@@ -4221,6 +4221,17 @@ async fn malformed_adjudication_output_blocks_under_advisory_provider_policy() {
         .args(["--output", "json"])
         .assert()
         .code(1);
+    let records: Vec<Value> = String::from_utf8_lossy(&out.get_output().stderr)
+        .lines()
+        .filter_map(|line| line.strip_prefix("postil: adjudication-output "))
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["event"], "callStarted");
+    assert_eq!(records[1]["event"], "parserRejected");
+    assert_eq!(records[1]["code"], "noArray");
+    assert_eq!(records[1]["call"], records[0]["call"]);
+    assert_eq!(records[1]["attempt"], Value::Null);
     let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
 
     assert!(

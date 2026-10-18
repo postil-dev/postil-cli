@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { execFile as execFileCallback } from "node:child_process";
+import { createHash } from "node:crypto";
+import { promisify } from "node:util";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -12,6 +15,10 @@ import {
   parseUnifiedDiffFiles,
 } from "./harness";
 import {
+  ADJUDICATION_OUTPUT_PREFIX,
+  adjudicationOutput,
+  assertScorerDiagnosticCustody,
+  runScorerDiagnostic,
   canonicalProviderCost,
   FALSE_FINDING_CASES,
   GENERATOR_MODEL,
@@ -2324,3 +2331,280 @@ describe("formatReport", () => {
     )).toBe("0.000000123");
   });
 });
+
+
+function provenanceRecord(overrides: Record<string, unknown> = {}) {
+  return {
+    attempt: null, call: 1, code: "noArray", event: "parserRejected", expected: 1,
+    field: null, finish: null, observed: null, phase: "adjudication", stage: "arrayExtraction", version: 1,
+    ...overrides,
+  };
+}
+const provenanceLine = (value: unknown) => `${ADJUDICATION_OUTPUT_PREFIX}${JSON.stringify(value)}`;
+
+describe("finite adjudication provenance", () => {
+  test("accepts only canonical closed bounded records and retains ordered duplicates", () => {
+    const line = provenanceLine(provenanceRecord());
+    expect(adjudicationOutput("")).toBeUndefined();
+    expect(adjudicationOutput(`${line}\n${line}`)).toMatchObject({
+      records: [provenanceRecord(), provenanceRecord()], malformed: 0, duplicates: 1, omitted: 0,
+    });
+    const hostile = String.fromCharCode(115, 107, 45) + crypto.randomUUID();
+    const mutations = [
+      { version: 2 }, { phase: hostile }, { event: hostile }, { stage: hostile }, { code: hostile },
+      { event: ["callStarted"], stage: "chatTerminal", code: "started", expected: null },
+      { event: "callStarted", stage: ["chatTerminal"], code: "started", expected: null },
+      { call: 0 }, { call: 65 }, { attempt: 1 }, { expected: 21 }, { expected: -1 },
+      { field: hostile }, { finish: hostile }, { observed: 1 }, { [hostile]: true },
+      { code: { secret: hostile } }, { expected: [] },
+    ];
+    for (const mutation of mutations) {
+      const parsed = adjudicationOutput(provenanceLine(provenanceRecord(mutation)));
+      expect(parsed?.records.length).toBe(0);
+      expect(parsed?.malformed).toBe(1);
+      expect(JSON.stringify(parsed).includes(hostile)).toBe(false);
+    }
+    for (const bad of [
+      line.replace('"version":1', '"version":2,"version":1'),
+      line + " ",
+      ADJUDICATION_OUTPUT_PREFIX + "x".repeat(513),
+      ADJUDICATION_OUTPUT_PREFIX + "é".repeat(256),
+    ]) expect(adjudicationOutput(bad)?.malformed).toBe(1);
+    const bounded = adjudicationOutput(Array.from({ length: 40 }, () => line).join("\n"));
+    expect(bounded).toMatchObject({ malformed: 0, duplicates: 31, omitted: 8 });
+    expect(bounded?.records.length).toBe(32);
+    expect(adjudicationOutput(`${line}\n`.repeat(66_000))?.omitted).toBe(65535);
+    const invalidEnvelope = scorerCaseDiagnostics({
+      child: { exitCode: 1, stderr: line, timedOut: false }, attempts: [], passed: false,
+    });
+    expect(invalidEnvelope.failureSignals).toContain("invalidEnvelope");
+    expect(invalidEnvelope.adjudicationOutput?.records).toEqual([provenanceRecord()]);
+    const events = [
+      provenanceRecord({ code: "started", event: "callStarted", stage: "chatTerminal", expected: null }),
+      provenanceRecord({ code: "emptyContent", event: "attemptRejected", stage: "endpointContent", attempt: 1, expected: null }),
+      provenanceRecord({ code: "accepted", event: "parsed", stage: "resultCount", observed: 1 }),
+    ];
+    expect(adjudicationOutput(events.map(provenanceLine).join("\n"))?.records).toEqual(events);
+  });
+
+  test("real child preserves baseline behavior with enabled counted scorer and mock publication", async () => {
+    const baseBinary = process.env.POSTIL_PROVENANCE_BASE_BIN;
+    const binaries = baseBinary ? [baseBinary, postilBinaryPath()] : [postilBinaryPath()];
+    const hostile = String.fromCharCode(115, 107, 45) + crypto.randomUUID();
+    const modes = ["accepted", "fenced", "noArray", "unclosedArray", "jsonSyntax", "resultCountMismatch",
+      "missingKnownField", "unknownField", "invalidEnum", "endpointMalformed", "emptyRecovered",
+      "missingChoicesRecovered", "emptyTerminal", "length", "tool_calls", "absentFinish"];
+    const keyName = "POSTIL_PROVENANCE_LOCAL_KEY";
+    const previous = process.env[keyName];
+    process.env[keyName] = crypto.randomUUID();
+    const pricing = { promptUsdPerToken: 0.000001, completionUsdPerToken: 0.000002,
+      inputMicrosPerMillionTokens: 1_000_000, outputMicrosPerMillionTokens: 2_000_000 };
+    const root = await mkdtemp(join(tmpdir(), "postil-provenance-e2e-"));
+    let mode = "accepted";
+    let adjudicationCalls = 0;
+    let scorerCalls = 0;
+    let requests: string[] = [];
+    const upstream = createServer(async (req, res) => {
+      const body = await requestBody(req);
+      requests.push(body);
+      const adjudication = adjudicationResponse(body);
+      let content = adjudication ?? JSON.stringify({ scores: [{ confidence: 0.2, kind: "uncertainty",
+        reason: "The claimed runtime break is unsupported by the change." }] });
+      let finish: string | undefined = "stop";
+      if (adjudication !== null) {
+        adjudicationCalls++;
+        if (mode === "endpointMalformed") { res.writeHead(200); res.end("{?"); return; }
+        if (mode === "missingChoicesRecovered" && adjudicationCalls === 1) {
+          res.writeHead(200); res.end(JSON.stringify({ usage: { prompt_tokens: 30, completion_tokens: 10, cost: 0.000045 } })); return;
+        }
+        if (mode === "noArray") content = `refusal ${hostile} https://example.invalid/${hostile}`;
+        if (mode === "unclosedArray") content = "[";
+        if (mode === "jsonSyntax") content = "[?]";
+        if (mode === "resultCountMismatch") content = "[]";
+        if (mode === "missingKnownField") content = "[{}]";
+        if (mode === "unknownField") content = JSON.stringify([{ ...JSON.parse(adjudication)[0], [hostile]: hostile }]);
+        if (mode === "invalidEnum") content = JSON.stringify([{ ...JSON.parse(adjudication)[0], status: hostile }]);
+        if (mode === "emptyTerminal" || (mode === "emptyRecovered" && adjudicationCalls === 1)) content = " ";
+        if (mode === "length" || mode === "tool_calls") finish = mode;
+        if (mode === "absentFinish") finish = undefined;
+        if (mode === "fenced") content = `prose \`\`\`json\n${adjudication}\n\`\`\``;
+      } else scorerCalls++;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ model: TEST_SCORER_MODEL, provider: "Azure",
+        choices: [{ finish_reason: finish, message: { content } }],
+        usage: { prompt_tokens: 30, completion_tokens: 10, cost: 0.000045 } }));
+    });
+    const apiBase = await listen(upstream);
+    try {
+      for (mode of modes) {
+        const observations = [];
+        for (const [index, binary] of binaries.entries()) {
+          adjudicationCalls = 0; scorerCalls = 0; requests = [];
+          const runRoot = join(root, mode, String(index));
+          const c = fixture("clean-comment-only");
+          const evaluation = await runScorerEvalCase(c, "falseFinding", TEST_SCORER_MODEL, 1,
+            binary, runRoot, apiBase, keyName, pricing);
+          const artifacts = join(runRoot, safeSegment(TEST_SCORER_MODEL), "repeat-1", c.id, "artifacts");
+          const envelope = envelopeV1.parse(JSON.parse(await readFile(join(artifacts, "stdout.json"), "utf8")));
+          const success = ["accepted", "fenced", "emptyRecovered", "missingChoicesRecovered"].includes(mode);
+          expect(evaluation.envelopeProduced).toBe(true);
+          expect(envelope.findings.some((finding) => finding.path === ".postil/model-output")).toBe(!success);
+          const publication = JSON.parse(await readFile(join(artifacts, "publication-telemetry.json"), "utf8"));
+          expect(publication.checkRunCreates).toBe(2);
+          expect(publication.checkRunCompletions).toBe(2);
+          expect(publication.finalFindings).toBe(success ? 0 : 2);
+          expect(scorerCalls).toBe(success ? 1 : 0);
+          expect(evaluation.gateFailing).toBe(!success);
+          expect(evaluation.findingPublished).toBe(!success);
+          expect(evaluation.finalConfidence).toBe(success ? 0.2 : 0.95);
+          expect(evaluation.diagnostics?.scorer.attempts).toBe(success ? 1 : 0);
+          expect(evaluation.diagnostics?.childExitCode).toBe(success ? 0 : 1);
+          const projection = evaluation.diagnostics?.adjudicationOutput;
+          if (baseBinary && index === 0) expect(projection).toBeUndefined();
+          else {
+            expect(projection?.malformed).toBe(0);
+            expect(projection?.records[0]?.event).toBe("callStarted");
+            expect(projection?.records.every((record) => record.call === 1)).toBe(true);
+            const expectedCode = success ? "accepted" :
+              mode === "emptyTerminal" ? "emptyContent" :
+              ["length", "tool_calls", "absentFinish"].includes(mode) ? "nonterminalStop" : mode;
+            expect(projection?.records.at(-1)?.code).toBe(expectedCode);
+            if (["length", "tool_calls", "absentFinish"].includes(mode)) {
+              expect(projection?.records.at(-1)?.finish).toBe(mode === "absentFinish" ? "absent" : mode);
+              expect(adjudicationCalls).toBe(1);
+            }
+            expect(projection?.records.at(-1)?.event).toBe(success ? "parsed" :
+              ["endpointMalformed", "emptyTerminal", "length", "tool_calls", "absentFinish"].includes(mode) ? "callFailed" : "parserRejected");
+            expect(JSON.stringify(projection).includes(hostile)).toBe(false);
+            if (mode === "emptyRecovered" || mode === "missingChoicesRecovered") {
+              expect(projection?.records.map((record) => record.event)).toEqual(["callStarted", "attemptRejected", "parsed"]);
+              expect(projection?.records[1]?.attempt).toBe(1);
+            }
+            const jsonOut = join(root, "finite.json");
+            await writeScorerEvalCheckpoint(jsonOut, [TEST_SCORER_MODEL], 1, 36, [evaluation]);
+            const partial = JSON.parse(await readFile(scorerCheckpointPath(jsonOut), "utf8"));
+            expect(partial.cases[0].diagnostics.adjudicationOutput).toEqual(projection);
+            await finalizeScorerEvalReport(jsonOut, JSON.stringify({ diagnostics: evaluation.diagnostics }));
+            expect((await readFile(jsonOut, "utf8")).includes(hostile)).toBe(false);
+            const clean = { ...evaluation, diagnostics: undefined };
+            const replaced = { ...evaluation, diagnostics: { ...evaluation.diagnostics!, adjudicationOutput: undefined } };
+            expect(scorerCasePasses(clean)).toBe(scorerCasePasses(evaluation));
+            expect(isAdmissionFatalStructuralResult(replaced, TEST_SCORER_MODEL)).toBe(isAdmissionFatalStructuralResult(evaluation, TEST_SCORER_MODEL));
+            expect(aggregate(TEST_SCORER_MODEL, [clean], 3)).toEqual(aggregate(TEST_SCORER_MODEL, [evaluation], 3));
+            const decision = (entry: ScorerEvalCase) => qualificationExitCode({
+              ...scorerReportContract(), generatedAt: "", qualificationSourceSha: "a".repeat(40),
+              cliBinarySha256: "b".repeat(64), apiBase, upstreamProvider: "Azure", upstreamProviderRoute: "azure/us",
+              repeats: 3, completedCases: 1, totalCases: 36, matrixComplete: false, passed: false,
+              models: [aggregate(TEST_SCORER_MODEL, [entry], 3)], cases: [entry],
+            });
+            expect(decision(clean)).toBe(decision(evaluation));
+            expect(decision(replaced)).toBe(1);
+          }
+          observations.push({ requests: requests.map((body) => createHash("sha256").update(body).digest("hex")), adjudicationCalls, scorerCalls,
+            semantic: { findings: envelope.findings, gate: envelope.gate, counts: envelope.counts,
+              modelUsage: envelope.modelUsage, modelIncidents: envelope.modelIncidents,
+              usage: envelope.usage, publication, publicationValid: evaluation.publicationValid } });
+        }
+        if (baseBinary) expect(observations[1]).toEqual(observations[0]);
+      }
+    } finally {
+      if (previous === undefined) delete process.env[keyName]; else process.env[keyName] = previous;
+      await close(upstream);
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 240_000);
+});
+
+
+test("diagnostic custody rejects dirty, stale and mismatched inputs before generation and uses the strict route locally", async () => {
+  const exec = promisify(execFileCallback);
+  const repositoryRoot = resolve(import.meta.dir, "..", "..");
+  const sourceSha = (await exec("git", ["rev-parse", "HEAD"], { cwd: repositoryRoot })).stdout.trim();
+  const paths = (await exec("git", ["ls-files", "-z", "--", "bench/src", "bench/fixtures",
+    "bench/evaluator-contract-sources.json", "bench/review-contract-sources.json", "bench/package.json",
+    "bench/bun.lock", "config.toml", "provisional-models.json"], { cwd: repositoryRoot })).stdout.split("\0").filter(Boolean);
+  const evaluatorSha256 = scorerEvaluatorDigest(await Promise.all(paths.map(async (path) => ({ path,
+    contents: await readFile(join(repositoryRoot, path)) }))));
+  const binary = postilBinaryPath();
+  const cliBinarySha256 = createHash("sha256").update(await readFile(binary)).digest("hex");
+  const input = { binary, sourceSha, evaluatorSha256, cliBinarySha256, keyName: "POSTIL_API_KEY" };
+  const keyPrevious = process.env.POSTIL_API_KEY;
+  process.env.POSTIL_API_KEY = crypto.randomUUID();
+  const dirty = await mkdtemp(join(tmpdir(), "postil-diagnostic-dirty-"));
+  await exec("git", ["init", dirty]);
+  await writeFile(join(dirty, "source.rs"), "dirty source\n");
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  let pricingCalls = 0;
+  let adjudicationCalls = 0;
+  let scorerCalls = 0;
+  let identityFailures = 0;
+  let identityMode = "valid";
+  const requests: string[] = [];
+  const upstream = createServer(async (req, res) => {
+    const body = await requestBody(req);
+    requests.push(body);
+    const adjudication = adjudicationResponse(body);
+    if (adjudication !== null) adjudicationCalls++; else scorerCalls++;
+    const omitIdentity = adjudication !== null && (identityMode === "missingTerminal" ||
+      identityMode === "missingRecovered" && adjudicationCalls === 1);
+    if (omitIdentity) identityFailures++;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ...(omitIdentity ? {} : { model: GENERATOR_MODEL, provider: "Azure" }),
+      choices: [{ finish_reason: "stop", message: { content: adjudication ?? JSON.stringify({
+        scores: [{ confidence: 0.2, kind: "uncertainty", reason: "The claimed runtime break is unsupported by the change." }],
+      }) } }], usage: { prompt_tokens: 30, completion_tokens: 10, cost: 0.000045 } }));
+  });
+  const localBase = await listen(upstream);
+  globalThis.fetch = (async (url: Parameters<typeof fetch>[0], init?: RequestInit) => {
+    const target = String(url);
+    if (new URL(target).origin === "https://openrouter.ai" && new URL(target).pathname === "/api/v1/endpoints/zdr") {
+      calls++; pricingCalls++;
+      return Response.json({ data: [{ model_id: GENERATOR_MODEL, provider_name: "Azure", tag: "azure/us", status: 0,
+        supported_parameters: ["max_tokens", "max_completion_tokens", "reasoning", "reasoning_effort", "temperature", "response_format", "structured_outputs"],
+        pricing: { prompt: "0.000001", completion: "0.000002" } }] });
+    }
+    if (new URL(target).origin === "https://openrouter.ai" && new URL(target).pathname === "/api/v1/chat/completions") {
+      calls++;
+      return originalFetch(`${localBase}/chat/completions`, init);
+    }
+    // Mock forge/capture traffic is loopback; no other destination is allowed.
+    if (new URL(target).hostname !== "127.0.0.1") throw new Error("unexpected diagnostic destination");
+    return originalFetch(url, init);
+  }) as typeof fetch;
+  try {
+    await expect(assertScorerDiagnosticCustody({ ...input, repositoryRoot: dirty })).rejects.toThrow();
+    await expect(runScorerDiagnostic({ ...input, sourceSha: "0".repeat(40) })).rejects.toThrow();
+    await expect(runScorerDiagnostic({ ...input, evaluatorSha256: "0".repeat(64) })).rejects.toThrow();
+    await expect(runScorerDiagnostic({ ...input, cliBinarySha256: "0".repeat(64) })).rejects.toThrow();
+    expect(calls).toBe(0);
+    for (identityMode of ["valid", "missingRecovered", "missingTerminal"]) {
+      adjudicationCalls = 0; scorerCalls = 0; identityFailures = 0;
+      const diagnostic = await runScorerDiagnostic(input);
+      expect(diagnostic).toMatchObject({ diagnosticOnly: true, matrixComplete: false,
+        fixture: "clean-comment-only", scenario: "falseFinding", repeat: 1,
+        upstreamTimeoutMs: 30_000, childTimeoutMs: 65_000,
+        custody: { qualificationSourceSha: sourceSha, cliBinarySha256, evaluatorSha256 },
+        providerContract: { upstreamProviderIdentity: "Azure", upstreamProviderRoute: "azure/us",
+          dataCollection: "deny", zeroDataRetention: true, allowFallbacks: false },
+      });
+      expect(diagnostic.diagnostics?.adjudicationOutput?.malformed).toBe(0);
+      const records = diagnostic.diagnostics?.adjudicationOutput?.records ?? [];
+      expect(records.at(-1)?.event).toBe(identityMode === "missingTerminal" ? "callFailed" : "parsed");
+      expect(scorerCalls).toBe(identityMode === "missingTerminal" ? 0 : 1);
+      expect(identityFailures).toBe(identityMode === "valid" ? 0 : identityMode === "missingRecovered" ? 1 : 3);
+      expect(diagnostic.findingPublished).toBe(identityMode === "missingTerminal");
+      expect(diagnostic.gateFailing).toBe(identityMode === "missingTerminal");
+      if (identityMode === "missingRecovered") expect(records[1]).toMatchObject({
+        event: "attemptRejected", code: "identityMissing", attempt: 1, call: 1,
+      });
+    }
+    expect(pricingCalls).toBe(3);
+    expect(requests.length).toBeGreaterThan(0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (keyPrevious === undefined) delete process.env.POSTIL_API_KEY; else process.env.POSTIL_API_KEY = keyPrevious;
+    await close(upstream);
+    await rm(dirty, { recursive: true, force: true });
+  }
+}, 120_000);

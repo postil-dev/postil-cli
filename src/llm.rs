@@ -3260,6 +3260,10 @@ impl LlmClient {
             }))
     }
 
+    fn adjudication_trace(record: serde_json::Value) {
+        eprintln!("postil: adjudication-output {}", record);
+    }
+
     pub(crate) async fn adjudicate_findings(
         &self,
         model: &str,
@@ -3269,6 +3273,11 @@ impl LlmClient {
         timeout: Duration,
     ) -> std::result::Result<AdjudicationReview, ModelError> {
         let mut client = self.clone();
+        Self::adjudication_trace(adjudication_record(
+            "callStarted",
+            "chatTerminal",
+            "started",
+        ));
         let deadline = Instant::now() + timeout;
         client.scorer_deadline = Some(
             self.total_deadline
@@ -3292,6 +3301,12 @@ impl LlmClient {
             )
             .await
             .map_err(|error| {
+                Self::adjudication_trace(adjudication_chat_record(
+                    &error,
+                    "callFailed",
+                    "chatTerminal",
+                    None,
+                ));
                 let mut model_error = ModelError::new(error, usage, usage_accounting_complete);
                 model_error.model_usage = model_usage.clone();
                 model_error
@@ -3299,21 +3314,22 @@ impl LlmClient {
                     .push(model_error.incident(ModelIncidentPhase::Scorer));
                 model_error
             })?;
-        let results = parse_adjudication_results(&content, expected_len).map_err(|detail| {
-            let mut error = ModelError::new(
-                anyhow!("finding adjudication output invalid: {detail}"),
-                usage,
-                usage_accounting_complete,
-            );
-            error.model_usage = model_usage.clone();
-            error.model_incidents.push(ModelIncident {
-                phase: ModelIncidentPhase::Scorer,
-                category: ModelIncidentCategory::InvalidOutput,
-                recovered: false,
-                recovery: None,
-            });
-            error
-        })?;
+        let results =
+            parse_adjudication_results(&content, expected_len, true).map_err(|detail| {
+                let mut error = ModelError::new(
+                    anyhow!("finding adjudication output invalid: {detail}"),
+                    usage,
+                    usage_accounting_complete,
+                );
+                error.model_usage = model_usage.clone();
+                error.model_incidents.push(ModelIncident {
+                    phase: ModelIncidentPhase::Scorer,
+                    category: ModelIncidentCategory::InvalidOutput,
+                    recovered: false,
+                    recovery: None,
+                });
+                error
+            })?;
         Ok(AdjudicationReview {
             results,
             usage,
@@ -4514,6 +4530,14 @@ impl LlmClient {
                         match openai_response_error_status(&response.text) {
                             Ok(status) => status.unwrap_or(response.status),
                             Err(error) => {
+                                if matches!(phase, LlmPhase::Adjudication) {
+                                    Self::adjudication_trace(adjudication_chat_record(
+                                        &error,
+                                        "attemptRejected",
+                                        "endpointErrorContract",
+                                        Some(attempt),
+                                    ));
+                                }
                                 if let Some(response_usage) = summary.usage {
                                     add_usage(usage, response_usage);
                                 } else {
@@ -4568,6 +4592,14 @@ impl LlmClient {
                                 expected_provider,
                             )
                         {
+                            if matches!(phase, LlmPhase::Adjudication) {
+                                Self::adjudication_trace(adjudication_chat_record(
+                                    &error,
+                                    "attemptRejected",
+                                    "endpointContent",
+                                    Some(attempt),
+                                ));
+                            }
                             if let Some(response_usage) = summary.usage {
                                 add_usage(usage, response_usage);
                             } else {
@@ -4625,6 +4657,14 @@ impl LlmClient {
                                 });
                             }
                             Err(error) => {
+                                if matches!(phase, LlmPhase::Adjudication) {
+                                    Self::adjudication_trace(adjudication_chat_record(
+                                        &error,
+                                        "attemptRejected",
+                                        "endpointContent",
+                                        Some(attempt),
+                                    ));
+                                }
                                 let parse_added_usage = usage.prompt_tokens
                                     != usage_before_parse.prompt_tokens
                                     || usage.completion_tokens
@@ -6295,13 +6335,202 @@ fn parse_scores(content: &str, expected_len: usize) -> Result<Vec<FindingScore>,
         .collect::<Result<Vec<_>, String>>()
 }
 
+// This wire object has fixed keys and finite values only. Null means unavailable;
+// counts saturate independently of the authoritative parser and retries. The
+// private review entry point calls adjudicate_findings once per child process;
+// call=1 is scoped to that child, not a shared or proxy request counter.
+fn adjudication_record(
+    event: &'static str,
+    stage: &'static str,
+    code: &'static str,
+) -> serde_json::Value {
+    json!({"version":1,"phase":"adjudication","event":event,"stage":stage,"code":code,
+        "call":1,"attempt":null,"expected":null,"observed":null,"field":null,"finish":null})
+}
+
+fn adjudication_chat_record(
+    error: &anyhow::Error,
+    event: &'static str,
+    stage: &'static str,
+    attempt: Option<u32>,
+) -> serde_json::Value {
+    let code = if error.downcast_ref::<DeadlineExceeded>().is_some() {
+        "deadline"
+    } else if error.downcast_ref::<ReviewContextExceeded>().is_some() {
+        "contextExceeded"
+    } else if let Some(identity) = error.downcast_ref::<AtomicAttributionIdentityFailure>() {
+        match identity {
+            AtomicAttributionIdentityFailure::Missing => "identityMissing",
+            AtomicAttributionIdentityFailure::Mismatch => "identityMismatch",
+        }
+    } else if let Some(content) = error.downcast_ref::<ModelContentFailure>() {
+        match content {
+            ModelContentFailure::Empty => "emptyContent",
+            ModelContentFailure::Malformed => "endpointMalformed",
+            ModelContentFailure::MissingChoices => "missingChoices",
+            ModelContentFailure::NonTerminal { .. } => "nonterminalStop",
+        }
+    } else if error.chain().any(|cause| {
+        cause.downcast_ref::<RequestTimedOut>().is_some()
+            || cause
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_timeout)
+            || cause
+                .downcast_ref::<ProviderHttpFailure>()
+                .is_some_and(|failure| timeout_status(failure.0.as_u16()))
+    }) {
+        "timeout"
+    } else if error.downcast_ref::<ProviderError>().is_some() {
+        "providerFailure"
+    } else {
+        "otherChatFailure"
+    };
+    let mut record = adjudication_record(event, stage, code);
+    record["attempt"] = json!(attempt.filter(|value| (1..=13).contains(value)));
+    if let Some(ModelContentFailure::NonTerminal { reason }) =
+        error.downcast_ref::<ModelContentFailure>()
+    {
+        record["finish"] = json!(match reason.as_str() {
+            "missing finish_reason" => "absent",
+            "end_turn" => "end_turn",
+            "stop_sequence" => "stop_sequence",
+            value => safe_finish_reason(value),
+        });
+    }
+    record
+}
+
+const ADJUDICATION_FIELDS: &[&str] = &[
+    "candidateId",
+    "status",
+    "revisedTitle",
+    "revisedBody",
+    "evidence",
+    "duplicateOf",
+    "scope",
+    "disposition",
+    "cause",
+    "reason",
+    "path",
+    "side",
+    "line",
+    "byteOffset",
+    "diffLine",
+    "corpusSha256",
+];
+
+fn adjudication_json_class(error: &serde_json::Error) -> (&'static str, &'static str) {
+    use serde_json::error::Category;
+    match error.classify() {
+        Category::Syntax => return ("jsonSyntax", "other"),
+        Category::Eof => return ("jsonEof", "other"),
+        Category::Io => return ("unexpectedIo", "other"),
+        Category::Data => {}
+    }
+    // Only serde's Data errors enter template refinement. Match the complete
+    // pinned template, including its generated location suffix; never scan an
+    // arbitrary provider string or expose the message/key/enum value.
+    let detail = error.to_string();
+    let suffix = format!(" at line {} column {}", error.line(), error.column());
+    let Some(message) = detail.strip_suffix(&suffix) else {
+        return ("otherData", "other");
+    };
+    for &field in ADJUDICATION_FIELDS {
+        if message == format!("missing field `{field}`") {
+            return ("missingKnownField", field);
+        }
+        if message == format!("duplicate field `{field}`") {
+            return ("duplicateKnownField", field);
+        }
+    }
+    let quoted_atom = |prefix: &str, suffix: &str| {
+        message
+            .strip_prefix(prefix)
+            .and_then(|text| text.strip_suffix(suffix))
+            .is_some_and(|atom| {
+                !atom.is_empty()
+                    && atom.len() <= 128
+                    && !atom.chars().any(|c| c == '`' || c.is_control())
+            })
+    };
+    if quoted_atom(
+        "unknown field `",
+        "`, expected one of `candidateId`, `status`, `revisedTitle`, `revisedBody`, `evidence`, `duplicateOf`, `scope`",
+    ) {
+        return ("unknownField", "other");
+    }
+    if quoted_atom(
+        "unknown variant `",
+        "`, expected one of `confirmed`, `refuted`, `unresolved`",
+    ) {
+        return ("invalidEnum", "status");
+    }
+    if [
+        "invalid type: null, expected a string",
+        "invalid type: null, expected a sequence",
+        "invalid type: boolean `true`, expected a string",
+        "invalid type: boolean `false`, expected a string",
+    ]
+    .contains(&message)
+    {
+        return ("wrongType", "other");
+    }
+    ("otherData", "other")
+}
+
+fn adjudication_count(value: usize) -> serde_json::Value {
+    if value <= 20 {
+        json!(value)
+    } else {
+        json!("overflow")
+    }
+}
+
 fn parse_adjudication_results(
     content: &str,
     expected_len: usize,
+    trace: bool,
 ) -> Result<Vec<AdjudicationResult>, String> {
-    let json = extract_json_array(content).ok_or("no JSON array found")?;
-    let results =
-        serde_json::from_str::<Vec<AdjudicationResult>>(json).map_err(|error| error.to_string())?;
+    let emit = |mut record: serde_json::Value| {
+        record["expected"] = adjudication_count(expected_len);
+        if trace {
+            LlmClient::adjudication_trace(record);
+        }
+    };
+    let json = extract_json_array(content).ok_or_else(|| {
+        emit(adjudication_record(
+            "parserRejected",
+            "arrayExtraction",
+            if content.contains('[') {
+                "unclosedArray"
+            } else {
+                "noArray"
+            },
+        ));
+        "no JSON array found".to_owned()
+    })?;
+    let results = serde_json::from_str::<Vec<AdjudicationResult>>(json).map_err(|error| {
+        let (code, field) = adjudication_json_class(&error);
+        let mut record = adjudication_record("parserRejected", "resultDeserialization", code);
+        record["field"] = json!(field);
+        emit(record);
+        error.to_string()
+    })?;
+    let mut record = adjudication_record(
+        if results.len() == expected_len {
+            "parsed"
+        } else {
+            "parserRejected"
+        },
+        "resultCount",
+        if results.len() == expected_len {
+            "accepted"
+        } else {
+            "resultCountMismatch"
+        },
+    );
+    record["observed"] = adjudication_count(results.len());
+    emit(record);
     if results.len() != expected_len {
         return Err(format!(
             "expected {expected_len} adjudication result(s), got {}",
@@ -9310,15 +9539,139 @@ mod tests {
     #[test]
     fn extracts_adjudication_array_from_fenced_output() {
         let text = "Here you go:\n```json\n[{\"candidateId\":\"candidate\",\"status\":\"unresolved\"}]\n```";
-        let results = parse_adjudication_results(text, 1).unwrap();
+        let results = parse_adjudication_results(text, 1, false).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].candidate_id, "candidate");
     }
 
     #[test]
+    fn adjudication_provenance_classifies_only_generated_serde_errors() {
+        let hostile = format!(
+            "{}{}",
+            String::from_utf8(vec![115, 107, 45]).unwrap(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let cases = [
+            (json!([{"status":"confirmed"}]).to_string(), ("missingKnownField", "candidateId")),
+            (r#"[{"candidateId":"x","candidateId":"y","status":"confirmed"}]"#.to_owned(), ("duplicateKnownField", "candidateId")),
+            (json!([{"candidateId":null,"status":"confirmed"}]).to_string(), ("wrongType", "other")),
+            (json!([{"candidateId":"x","status":&hostile}]).to_string(), ("invalidEnum", "status")),
+            (json!([{"candidateId":"x","status":"confirmed",&hostile:true}]).to_string(), ("unknownField", "other")),
+            (json!([{"candidateId":"x","status":"confirmed","scope":{"disposition":"introducedOrWorsened","reason":"x","cause":{"unexpected":&hostile}}}]).to_string(), ("otherData", "other")),
+        ];
+        for (input, expected) in cases {
+            let error = serde_json::from_str::<Vec<AdjudicationResult>>(&input).unwrap_err();
+            let actual = adjudication_json_class(&error);
+            assert_eq!(actual, expected);
+            assert!(
+                !json!({"code":actual.0,"field":actual.1})
+                    .to_string()
+                    .contains(&hostile)
+            );
+        }
+        for (input, expected) in [("[", "jsonEof"), ("[?]", "jsonSyntax")] {
+            let error = serde_json::from_str::<Vec<AdjudicationResult>>(input).unwrap_err();
+            assert_eq!(adjudication_json_class(&error).0, expected);
+        }
+        assert_eq!(adjudication_count(20), json!(20));
+        assert_eq!(adjudication_count(21), json!("overflow"));
+        assert_eq!(adjudication_count(usize::MAX), json!("overflow"));
+    }
+
+    #[tokio::test]
+    async fn adjudication_provenance_pre_request_failures_have_no_attempt_usage() {
+        for (oversized, code) in [(true, "contextExceeded"), (false, "deadline")] {
+            let server = MockServer::start().await;
+            let config = Config {
+                api_base: server.uri(),
+                model: "example/unknown-context".into(),
+                ..Config::default()
+            };
+            let mut client = LlmClient::build(
+                &config,
+                std::process::id().to_string(),
+                Duration::from_secs(1),
+                None,
+                None,
+            )
+            .unwrap();
+            if !oversized {
+                client.total_deadline = Some(Instant::now());
+            }
+            let user = if oversized {
+                "x".repeat(40_000)
+            } else {
+                "[]".to_owned()
+            };
+            let error = match client
+                .adjudicate_findings(&config.model, "system", &user, 1, Duration::from_secs(1))
+                .await
+            {
+                Ok(_) => panic!("pre-request rejection unexpectedly succeeded"),
+                Err(error) => error,
+            };
+            assert!(error.model_usage.is_empty());
+            assert!(server.received_requests().await.unwrap().is_empty());
+            let record = adjudication_chat_record(&error.error, "callFailed", "chatTerminal", None);
+            assert_eq!(record["code"], code);
+            assert_eq!(record["attempt"], serde_json::Value::Null);
+        }
+    }
+
+    #[test]
+    fn adjudication_provenance_terminal_types_do_not_infer_success() {
+        let cases: Vec<(anyhow::Error, &str)> = vec![
+            (DeadlineExceeded(LlmPhase::Adjudication).into(), "deadline"),
+            (
+                ReviewContextExceeded {
+                    required: 2,
+                    limit: 1,
+                }
+                .into(),
+                "contextExceeded",
+            ),
+            (RequestTimedOut.into(), "timeout"),
+            (
+                AtomicAttributionIdentityFailure::Missing.into(),
+                "identityMissing",
+            ),
+            (
+                AtomicAttributionIdentityFailure::Mismatch.into(),
+                "identityMismatch",
+            ),
+            (anyhow!("unclassified local failure"), "otherChatFailure"),
+        ];
+        for (error, expected) in cases {
+            let record = adjudication_chat_record(&error, "callFailed", "chatTerminal", None);
+            assert_eq!(record["code"], expected);
+            assert_eq!(record["attempt"], serde_json::Value::Null);
+            assert!(record.to_string().len() + "postil: adjudication-output ".len() <= 512);
+        }
+        for (reason, expected) in [
+            ("length", "length"),
+            ("missing finish_reason", "absent"),
+            ("end_turn", "end_turn"),
+            ("stop_sequence", "stop_sequence"),
+            ("unrecognized", "reported"),
+        ] {
+            let error = ModelContentFailure::NonTerminal {
+                reason: reason.to_owned(),
+            }
+            .into();
+            let record =
+                adjudication_chat_record(&error, "attemptRejected", "endpointContent", Some(1));
+            assert_eq!(record["finish"], expected);
+        }
+    }
+
+    #[test]
     fn rejects_adjudication_output_without_a_json_array() {
         assert_eq!(
-            parse_adjudication_results("I could not adjudicate this finding.", 1).unwrap_err(),
+            parse_adjudication_results("I could not adjudicate this finding.", 1, false)
+                .unwrap_err(),
             "no JSON array found"
         );
     }
