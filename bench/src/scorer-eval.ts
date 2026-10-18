@@ -277,7 +277,8 @@ export function adjudicationOutput(stderr: string): AdjudicationOutput | undefin
       const value = JSON.parse(raw);
       if (!value || typeof value !== "object" || Array.isArray(value)) throw 0;
       const { attempt, call, code, event, expected, field, finish, observed, phase, stage, version } = value;
-      if (version !== 1 || phase !== "adjudication" || !Object.hasOwn(OUTPUT_CODES, event) ||
+      if (version !== 1 || phase !== "adjudication" || typeof event !== "string" ||
+        typeof stage !== "string" || typeof code !== "string" || !Object.hasOwn(OUTPUT_CODES, event) ||
         call !== 1 || !ordinal(attempt, 13) || !count(expected) || !count(observed) ||
         !(field === null || OUTPUT_FIELDS.includes(field)) ||
         !(finish === null || ["stop", "length", "tool_calls", "content_filter", "error", "reported", "absent", "end_turn", "stop_sequence"].includes(finish))) throw 0;

@@ -2352,6 +2352,8 @@ describe("finite adjudication provenance", () => {
     const hostile = String.fromCharCode(115, 107, 45) + crypto.randomUUID();
     const mutations = [
       { version: 2 }, { phase: hostile }, { event: hostile }, { stage: hostile }, { code: hostile },
+      { event: ["callStarted"], stage: "chatTerminal", code: "started", expected: null },
+      { event: "callStarted", stage: ["chatTerminal"], code: "started", expected: null },
       { call: 0 }, { call: 65 }, { attempt: 1 }, { expected: 21 }, { expected: -1 },
       { field: hostile }, { finish: hostile }, { observed: 1 }, { [hostile]: true },
       { code: { secret: hostile } }, { expected: [] },
