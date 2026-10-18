@@ -45,7 +45,7 @@ const HOST_TARGET: &str = "aarch64-apple-darwin";
 fn link_test_tools(tools: &Path) {
     for command in [
         "awk", "chmod", "cp", "grep", "gzip", "head", "ls", "mkdir", "mktemp", "mv", "rm", "tar",
-        "uname",
+        "uname", "sh",
     ] {
         symlink(system_command(command), tools.join(command)).unwrap();
     }
@@ -140,11 +140,49 @@ impl InstallerFixture {
             .args(["--version", "v-test", "--bin-dir"])
             .arg(&self.bin)
             .args(extra_arguments)
+            .env_clear()
+            .env("HOME", self._root.path())
+            .env("TMPDIR", self._root.path())
             .env("PATH", &self.tools)
             .env("POSTIL_TEST_ARTIFACTS", &self.artifacts)
             .env("POSTIL_TEST_COSIGN_ARGS", &self.cosign_arguments)
             .env_remove("POSTIL_SKIP_SIG");
         command.output().unwrap()
+    }
+
+    fn replace_tool(&self, name: &str, body: &str) {
+        fs::remove_file(self.tools.join(name)).unwrap();
+        write_executable(&self.tools.join(name), body);
+    }
+
+    fn seed_old(&self) -> Vec<u8> {
+        let bytes = format!(
+            "#!/bin/sh\necho old-{}\n",
+            self._root.path().file_name().unwrap().to_string_lossy()
+        )
+        .into_bytes();
+        fs::write(self.bin.join("postil"), &bytes).unwrap();
+        fs::set_permissions(self.bin.join("postil"), fs::Permissions::from_mode(0o555)).unwrap();
+        bytes
+    }
+
+    fn assert_preserved(&self, bytes: &[u8]) {
+        let binary = self.bin.join("postil");
+        assert_eq!(fs::read(&binary).unwrap(), bytes);
+        assert_eq!(
+            fs::metadata(&binary).unwrap().permissions().mode() & 0o777,
+            0o555
+        );
+        let output = Command::new(binary).env_clear().output().unwrap();
+        assert!(output.status.success());
+        assert!(output.stdout.starts_with(b"old-"));
+        assert!(fs::read_dir(&self.bin).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".postil.")
+        }));
     }
 
     #[cfg(target_os = "linux")]
@@ -223,4 +261,97 @@ fn musl_host_downloads_the_musl_release_asset() {
 
     assert!(output.status.success(), "{output:?}");
     assert!(fixture.bin.join("postil").is_file());
+}
+
+#[test]
+fn failed_replacement_preserves_the_runnable_cli() {
+    for fault in [
+        "transfer",
+        "commit",
+        "stage-empty",
+        "stage-mode",
+        "source-empty",
+        "source-mode",
+        "chmod",
+        "mktemp",
+    ] {
+        let fixture = InstallerFixture::new(false);
+        let old = fixture.seed_old();
+        let real_move = system_command("mv");
+        let real_chmod = system_command("chmod");
+        match fault {
+            "transfer" | "commit" | "stage-empty" | "stage-mode" => fixture.replace_tool(
+                "mv",
+                &format!(
+                    r#"#!/bin/sh
+case "$1" in
+  -f) {commit} ;;
+  *) {transfer} ;;
+esac
+exec '{real_move}' "$@"
+"#,
+                    commit = if fault == "commit" { "exit 72" } else { ":" },
+                    transfer = match fault {
+                        "transfer" =>
+                            "rm -f \"$2\" || exit; printf partial > \"$2\"; exit 73".to_string(),
+                        "stage-empty" => format!(
+                            "'{}' \"$@\" || exit; : > \"$2\"; exit 0",
+                            real_move.display()
+                        ),
+                        "stage-mode" => format!(
+                            "'{}' \"$@\" || exit; '{}' a-x \"$2\"; exit",
+                            real_move.display(),
+                            real_chmod.display()
+                        ),
+                        _ => ":".to_string(),
+                    },
+                    real_move = real_move.display()
+                ),
+            ),
+            "mktemp" => fixture.replace_tool(
+                "mktemp",
+                &format!(
+                    "#!/bin/sh\ncase \"$*\" in *.postil.*) exit 74;; esac\nexec '{}' \"$@\"\n",
+                    system_command("mktemp").display()
+                ),
+            ),
+            _ => fixture.replace_tool(
+                "chmod",
+                &format!(
+                    "#!/bin/sh\n{}\n",
+                    match fault {
+                        "source-empty" =>
+                            format!("'{}' \"$@\" || exit; : > \"$2\"", real_chmod.display()),
+                        "source-mode" => format!("'{}' a-x \"$2\"", real_chmod.display()),
+                        _ => "exit 75".to_string(),
+                    }
+                ),
+            ),
+        }
+        let output = fixture.run(&[]);
+        assert!(!output.status.success(), "{fault}: {output:?}");
+        fixture.assert_preserved(&old);
+    }
+}
+
+#[test]
+fn successful_replacement_replaces_a_symlink_without_editing_its_target() {
+    let fixture = InstallerFixture::new(false);
+    let old = fixture.seed_old();
+    let target = fixture._root.path().join("old-target");
+    fs::rename(fixture.bin.join("postil"), &target).unwrap();
+    symlink(&target, fixture.bin.join("postil")).unwrap();
+    let output = fixture.run(&[]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        !fs::symlink_metadata(fixture.bin.join("postil"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read(target).unwrap(), old);
+    assert_eq!(
+        fs::read(fixture.bin.join("postil")).unwrap(),
+        b"#!/bin/sh\necho 'postil test-version'\n"
+    );
 }
