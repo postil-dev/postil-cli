@@ -12678,8 +12678,25 @@ mod tests {
             Ok(_) => panic!("oversized request reached the provider transport"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("per-request cap"));
         assert!(server.received_requests().await.unwrap().is_empty());
+        assert_eq!(client.admission.lock().unwrap().attempts, 0);
+        let expected = format!(
+            "model provider request needs {} serialized bytes, exceeding the {MAX_PROVIDER_REQUEST_BYTES} byte per-request cap",
+            MAX_PROVIDER_REQUEST_BYTES + 1
+        );
+        assert_eq!(error.root_cause().to_string(), expected);
+        assert!(error.downcast_ref::<ProviderAdmissionFailure>().is_some());
+        let error = ModelError::new(classify_chat_error(error), Usage::default(), true);
+        assert!(
+            error
+                .error
+                .downcast_ref::<ProviderAdmissionFailure>()
+                .is_some()
+        );
+        assert!(!error.is_provider());
+        assert!(!error.is_timeout());
+        assert!(!error.is_deadline_exceeded());
+        assert!(format!("{error:#}").contains(&expected));
     }
 
     #[test]
