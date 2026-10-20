@@ -2888,6 +2888,8 @@ async fn review_diff_at(
                                 baseline_candidate_indices,
                                 fallback_application,
                             ));
+                        } else {
+                            crate::llm::adjudication_not_required();
                         }
                         if !cfg.scorer_enabled() && !adjudication_incomplete {
                             // Local scoring is opt-in. An adjudication-only exclusion

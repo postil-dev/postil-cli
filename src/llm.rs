@@ -67,6 +67,93 @@ pub struct ScorerReview {
     pub usage_accounting_complete: bool,
 }
 
+const ADJUDICATION_METRICS_PREFIX: &str = "postil: adjudication-metrics ";
+const ADJUDICATION_METRICS_MAX_BYTES: usize = 2048;
+const ADJUDICATION_METRICS_ALPHABET: &[u8; 16] = b"!#$%&()*+,-./:;<";
+
+fn encode_adjudication_metrics(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .flat_map(|byte| [byte >> 4, byte & 15])
+        .map(|nibble| char::from(ADJUDICATION_METRICS_ALPHABET[usize::from(nibble)]))
+        .collect()
+}
+
+fn encode_adjudication_nonce(nonce: &str) -> String {
+    nonce
+        .bytes()
+        .map(|byte| {
+            let nibble = match byte {
+                b'0'..=b'9' => byte - b'0',
+                b'a'..=b'f' => byte - b'a' + 10,
+                _ => return '?',
+            };
+            char::from(ADJUDICATION_METRICS_ALPHABET[usize::from(nibble)])
+        })
+        .collect()
+}
+
+fn adjudication_timing(
+    start: Instant,
+    deadline: Instant,
+    first: Instant,
+    end: Instant,
+) -> [u128; 4] {
+    [
+        end.saturating_duration_since(start).as_millis(),
+        deadline.saturating_duration_since(start).as_millis(),
+        first.saturating_duration_since(start).as_millis(),
+        deadline.saturating_duration_since(first).as_millis(),
+    ]
+}
+
+fn adjudication_metrics_nonce(value: Option<String>) -> Option<String> {
+    value.filter(|nonce| {
+        nonce.len() == 32
+            && nonce
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+fn write_adjudication_metrics(
+    writer: &mut impl std::io::Write,
+    nonce: &str,
+    record: &serde_json::Value,
+) {
+    let Ok(payload) = serde_json::to_string(record) else {
+        return;
+    };
+    // Punctuation encoding keeps even short-written telemetry out of retry
+    // signatures. The closing challenge authenticates complete records.
+    let nonce = encode_adjudication_nonce(nonce);
+    let payload = encode_adjudication_metrics(payload.as_bytes());
+    let header = encode_adjudication_metrics(ADJUDICATION_METRICS_PREFIX.as_bytes());
+    let end = encode_adjudication_metrics(b"end");
+    let frame = format!("\u{1e}{header}{nonce} {payload} {nonce} {end}\n");
+    if frame.len() <= ADJUDICATION_METRICS_MAX_BYTES {
+        let _ = writer.write(frame.as_bytes());
+    }
+}
+
+fn emit_adjudication_metrics(record: serde_json::Value) {
+    if let Some(nonce) =
+        adjudication_metrics_nonce(std::env::var("POSTIL_BENCH_ADJUDICATION_NONCE").ok())
+    {
+        write_adjudication_metrics(&mut std::io::stderr().lock(), &nonce, &record);
+    }
+}
+
+pub(crate) fn adjudication_not_required() {
+    emit_adjudication_metrics(json!({
+        "version": 1, "phase": "adjudication", "outcome": "notRequired",
+        "callsStarted": 0, "correctionKind": null, "phaseElapsedMs": null,
+        "initialBudgetMs": null, "firstCallElapsedMs": null, "firstCallRemainingMs": null,
+        "promptTokens": null, "completionTokens": null, "costProviderDecimal": null,
+        "usageAccountingComplete": null, "incidents": [],
+    }));
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct AdjudicationReview {
     pub(crate) application: crate::adjudication::AdjudicationApplication,
@@ -3300,60 +3387,71 @@ impl LlmClient {
         F: Fn(Vec<AdjudicationResult>) -> Result<crate::adjudication::AdjudicationApplication>,
     {
         let mut client = self.clone();
-        let deadline = Instant::now() + timeout;
+        let phase_started = Instant::now();
+        let deadline = phase_started + timeout;
         client.scorer_deadline = Some(
             self.total_deadline
                 .map_or(deadline, |total| deadline.min(total)),
         );
-        let mut usage = Usage::default();
-        let mut model_usage = Vec::new();
-        let mut model_incidents: Vec<ModelIncident> = Vec::new();
-        let mut usage_accounting_complete = true;
-        let mut call_phase = LlmCallPhase::Initial;
-        let mut request_user = user.to_owned();
-        let mut last_validation_error = None;
-        let failure = |cause: anyhow::Error,
-                       usage,
-                       events: Vec<ModelUsage>,
-                       incidents,
-                       complete,
-                       validation_error: Option<&anyhow::Error>| {
-            let cause = match validation_error {
-                Some(validation) => {
-                    match validation.downcast_ref::<crate::adjudication::AdjudicationViolation>() {
-                        Some(violation) => cause.context(*violation),
-                        None => cause.context(validation.to_string()),
+        let mut first_settled = None;
+        let mut calls_started = 0;
+        let mut correction_kind = None;
+        let result = async {
+            let mut usage = Usage::default();
+            let mut model_usage = Vec::new();
+            let mut model_incidents: Vec<ModelIncident> = Vec::new();
+            let mut usage_accounting_complete = true;
+            let mut call_phase = LlmCallPhase::Initial;
+            let mut request_user = user.to_owned();
+            let mut last_validation_error = None;
+            let failure = |cause: anyhow::Error,
+                           usage,
+                           events: Vec<ModelUsage>,
+                           incidents,
+                           complete,
+                           validation_error: Option<&anyhow::Error>| {
+                let cause = match validation_error {
+                    Some(validation) => {
+                        match validation
+                            .downcast_ref::<crate::adjudication::AdjudicationViolation>()
+                        {
+                            Some(violation) => cause.context(*violation),
+                            None => cause.context(validation.to_string()),
+                        }
                     }
-                }
-                None => cause,
+                    None => cause,
+                };
+                let mut error = ModelError::new(cause, usage, complete);
+                error.model_usage = events;
+                error.model_incidents = incidents;
+                error
             };
-            let mut error = ModelError::new(cause, usage, complete);
-            error.model_usage = events;
-            error.model_incidents = incidents;
-            error
-        };
-        // Syntax and semantic correction share this one operation's budget.
-        for call in 0..2 {
-            Self::adjudication_trace_for_call(
-                adjudication_record("callStarted", "chatTerminal", "started"),
-                call_phase,
-            );
-            let previous_events = model_usage.len();
-            let content = client
-                .chat_with_temperature(
-                    model,
-                    system,
-                    &request_user,
-                    &mut usage,
-                    &mut model_usage,
-                    &mut usage_accounting_complete,
-                    MAX_ADJUDICATION_OUTPUT_TOKENS,
-                    0.0,
-                    LlmPhase::Adjudication,
+            // Syntax and semantic correction share this one operation's budget.
+            for call in 0..2 {
+                Self::adjudication_trace_for_call(
+                    adjudication_record("callStarted", "chatTerminal", "started"),
                     call_phase,
-                )
-                .await
-                .map_err(|cause| {
+                );
+                let previous_events = model_usage.len();
+                calls_started += 1;
+                let content = client
+                    .chat_with_temperature(
+                        model,
+                        system,
+                        &request_user,
+                        &mut usage,
+                        &mut model_usage,
+                        &mut usage_accounting_complete,
+                        MAX_ADJUDICATION_OUTPUT_TOKENS,
+                        0.0,
+                        LlmPhase::Adjudication,
+                        call_phase,
+                    )
+                    .await;
+                if call == 0 {
+                    first_settled = Some(Instant::now());
+                }
+                let content = content.map_err(|cause| {
                     Self::adjudication_trace_for_call(
                         adjudication_chat_record(&cause, "callFailed", "chatTerminal", None),
                         call_phase,
@@ -3376,109 +3474,147 @@ impl LlmClient {
                     }
                     error
                 })?;
-            let (application, correction_phase) =
-                match parse_adjudication_results(&content, expected_len, Some(call_phase)) {
-                    Ok(results) => {
-                        let application = validate(results);
-                        let recoverable = application.as_ref().err().is_some_and(|error| {
-                            error
-                                .downcast_ref::<crate::adjudication::AdjudicationViolation>()
-                                .is_some()
-                        });
-                        (
+                let (application, correction_phase) =
+                    match parse_adjudication_results(&content, expected_len, Some(call_phase)) {
+                        Ok(results) => {
+                            let application = validate(results);
+                            let recoverable = application.as_ref().err().is_some_and(|error| {
+                                error
+                                    .downcast_ref::<crate::adjudication::AdjudicationViolation>()
+                                    .is_some()
+                            });
+                            (
+                                application,
+                                recoverable.then_some(LlmCallPhase::SemanticRetry),
+                            )
+                        }
+                        Err(_) => (
+                            Err(anyhow!("finding adjudication syntax is invalid")),
+                            Some(LlmCallPhase::SchemaRepair),
+                        ),
+                    };
+                match application {
+                    Ok(application) => {
+                        client
+                            .remaining_budget(LlmPhase::Adjudication)
+                            .map_err(|cause| {
+                                let mut error = failure(
+                                    cause,
+                                    usage,
+                                    model_usage.clone(),
+                                    model_incidents.clone(),
+                                    usage_accounting_complete,
+                                    last_validation_error.as_ref(),
+                                );
+                                error
+                                    .model_incidents
+                                    .push(error.incident(ModelIncidentPhase::Scorer));
+                                error
+                            })?;
+                        for incident in &mut model_incidents {
+                            incident.recovered = true;
+                            incident.recovery = Some(ModelIncidentRecovery::Repair);
+                        }
+                        return Ok(AdjudicationReview {
                             application,
-                            recoverable.then_some(LlmCallPhase::SemanticRetry),
-                        )
+                            usage,
+                            model_usage,
+                            model_incidents,
+                            usage_accounting_complete,
+                        });
                     }
-                    Err(_) => (
-                        Err(anyhow!("finding adjudication syntax is invalid")),
-                        Some(LlmCallPhase::SchemaRepair),
-                    ),
+                    Err(cause) => {
+                        eprintln!("postil: finding adjudication validation failed: {cause:#}");
+                        last_validation_error = Some(cause);
+                        model_incidents.push(ModelIncident {
+                            phase: ModelIncidentPhase::Scorer,
+                            category: ModelIncidentCategory::InvalidOutput,
+                            recovered: false,
+                            recovery: None,
+                        });
+                    }
+                }
+                let Some(next_phase) = correction_phase.filter(|_| call == 0) else {
+                    break;
                 };
-            match application {
-                Ok(application) => {
-                    client
-                        .remaining_budget(LlmPhase::Adjudication)
-                        .map_err(|cause| {
-                            let mut error = failure(
-                                cause,
-                                usage,
-                                model_usage.clone(),
-                                model_incidents.clone(),
-                                usage_accounting_complete,
-                                last_validation_error.as_ref(),
-                            );
+                correction_kind = Some(match next_phase {
+                    LlmCallPhase::SchemaRepair => "schemaRepair",
+                    LlmCallPhase::SemanticRetry => "semanticRetry",
+                    LlmCallPhase::Initial => "initial",
+                });
+                let corrected = client
+                    .remaining_budget(LlmPhase::Adjudication)
+                    .and_then(|remaining| {
+                        ensure!(
+                            remaining.is_none_or(|remaining| remaining >= RETRY_ATTEMPT_RESERVE),
+                            "finding adjudication has no viable correction slot before its deadline"
+                        );
+                        adjudication_correction_user(user)
+                    })
+                    .map_err(|cause| {
+                        let mut error = failure(
+                            cause,
+                            usage,
+                            model_usage.clone(),
+                            model_incidents.clone(),
+                            usage_accounting_complete,
+                            last_validation_error.as_ref(),
+                        );
+                        if error.is_deadline_exceeded() {
                             error
                                 .model_incidents
                                 .push(error.incident(ModelIncidentPhase::Scorer));
-                            error
-                        })?;
-                    for incident in &mut model_incidents {
-                        incident.recovered = true;
-                        incident.recovery = Some(ModelIncidentRecovery::Repair);
-                    }
-                    return Ok(AdjudicationReview {
-                        application,
-                        usage,
-                        model_usage,
-                        model_incidents,
-                        usage_accounting_complete,
-                    });
-                }
-                Err(cause) => {
-                    eprintln!("postil: finding adjudication validation failed: {cause:#}");
-                    last_validation_error = Some(cause);
-                    model_incidents.push(ModelIncident {
-                        phase: ModelIncidentPhase::Scorer,
-                        category: ModelIncidentCategory::InvalidOutput,
-                        recovered: false,
-                        recovery: None,
-                    });
-                }
-            }
-            let Some(next_phase) = correction_phase.filter(|_| call == 0) else {
-                break;
-            };
-            let corrected = client
-                .remaining_budget(LlmPhase::Adjudication)
-                .and_then(|remaining| {
-                    ensure!(
-                        remaining.is_none_or(|remaining| remaining >= RETRY_ATTEMPT_RESERVE),
-                        "finding adjudication has no viable correction slot before its deadline"
-                    );
-                    adjudication_correction_user(user)
-                })
-                .map_err(|cause| {
-                    let mut error = failure(
-                        cause,
-                        usage,
-                        model_usage.clone(),
-                        model_incidents.clone(),
-                        usage_accounting_complete,
-                        last_validation_error.as_ref(),
-                    );
-                    if error.is_deadline_exceeded() {
+                        }
                         error
-                            .model_incidents
-                            .push(error.incident(ModelIncidentPhase::Scorer));
-                    }
-                    error
-                })?;
-            request_user = corrected;
-            call_phase = next_phase;
-            // Actual residual exposure is reserved atomically by the same
-            // provider path as the initial call, immediately before contact.
+                    })?;
+                request_user = corrected;
+                call_phase = next_phase;
+                // Actual residual exposure is reserved atomically by the same
+                // provider path as the initial call, immediately before contact.
+            }
+            Err(failure(
+                last_validation_error.unwrap_or_else(|| {
+                    anyhow!("finding adjudication output did not satisfy its admitted contract")
+                }),
+                usage,
+                model_usage,
+                model_incidents,
+                usage_accounting_complete,
+                None,
+            ))
         }
-        Err(failure(
-            last_validation_error.unwrap_or_else(|| {
-                anyhow!("finding adjudication output did not satisfy its admitted contract")
-            }),
-            usage,
-            model_usage,
-            model_incidents,
-            usage_accounting_complete,
-            None,
-        ))
+        .await;
+        let settled = Instant::now();
+        let (usage, incidents, complete) = match &result {
+            Ok(review) => (
+                review.usage,
+                &review.model_incidents,
+                review.usage_accounting_complete,
+            ),
+            Err(error) => (
+                error.usage(),
+                &error.model_incidents,
+                error.usage_accounting_complete,
+            ),
+        };
+        if let Some(first) = first_settled {
+            let effective_deadline = client.scorer_deadline.unwrap_or(deadline);
+            let [elapsed, budget, first_elapsed, remaining] =
+                adjudication_timing(phase_started, effective_deadline, first, settled);
+            emit_adjudication_metrics(json!({
+                "version": 1, "phase": "adjudication",
+                "outcome": if result.is_ok() { "validated" } else { "failed" },
+                "callsStarted": calls_started, "correctionKind": correction_kind,
+                "phaseElapsedMs": elapsed,
+                "initialBudgetMs": budget,
+                "firstCallElapsedMs": first_elapsed,
+                "firstCallRemainingMs": remaining,
+                "promptTokens": usage.prompt_tokens, "completionTokens": usage.completion_tokens,
+                "costProviderDecimal": usage.provider_cost.map(|cost| cost.to_string()),
+                "usageAccountingComplete": complete, "incidents": incidents,
+            }));
+        }
+        result
     }
 
     pub async fn resolve_uncertainty(
@@ -10097,6 +10233,102 @@ mod tests {
         client
     }
 
+    #[test]
+    fn adjudication_metrics_timing_preserves_effective_deadline_and_rounding() {
+        let start = Instant::now();
+        for deadline_ns in [0, 1, 999_999, 1_000_000, 1_000_001, 59_999_999_999] {
+            for first_ns in [0, 1, 999_999, 1_000_000, 1_999_999, 60_000_000_000] {
+                let first = start + Duration::from_nanos(first_ns);
+                let deadline = start + Duration::from_nanos(deadline_ns);
+                let [elapsed, budget, first_elapsed, remaining] = adjudication_timing(
+                    start,
+                    deadline,
+                    first,
+                    first + Duration::from_nanos(999_999),
+                );
+                assert!(elapsed >= first_elapsed);
+                assert!(remaining <= budget);
+                assert!(budget.saturating_sub(first_elapsed).abs_diff(remaining) <= 1);
+                assert_eq!(budget, u128::from(deadline_ns / 1_000_000));
+            }
+        }
+        let [_, budget, _, remaining] =
+            adjudication_timing(start, start - Duration::from_nanos(1), start, start);
+        assert_eq!((budget, remaining), (0, 0));
+    }
+
+    #[test]
+    fn adjudication_metrics_writer_is_bounded_and_nonpanicking() {
+        struct ShortWriter {
+            limit: usize,
+            bytes: Vec<u8>,
+            broken: bool,
+        }
+        impl std::io::Write for ShortWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.broken {
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+                let count = self.limit.min(bytes.len());
+                self.bytes.extend_from_slice(&bytes[..count]);
+                Ok(count)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                panic!("capture must not flush")
+            }
+        }
+        let nonce = format!("{:032x}", 17);
+        assert!(adjudication_metrics_nonce(None).is_none());
+        for invalid in [
+            String::new(),
+            "x".repeat(32),
+            "A".repeat(32),
+            "0".repeat(31),
+            "0".repeat(33),
+        ] {
+            assert!(adjudication_metrics_nonce(Some(invalid)).is_none());
+        }
+        assert_eq!(
+            adjudication_metrics_nonce(Some(nonce.clone())),
+            Some(nonce.clone())
+        );
+        let record = json!({"version": 1, "phase": "adjudication", "outcome": "failed",
+            "callsStarted": 2, "correctionKind": "semanticRetry", "phaseElapsedMs": 503,
+            "initialBudgetMs": 60000, "firstCallElapsedMs": 500, "firstCallRemainingMs": 59500,
+            "promptTokens": 9007199254740991u64, "completionTokens": 9007199254740991u64,
+            "costProviderDecimal": "340282366920938463463.374607431768211455",
+            "usageAccountingComplete": false, "incidents": [
+                {"phase": "scorer", "category": "invalidOutput", "recovered": false},
+                {"phase": "scorer", "category": "deadline", "recovered": false}]});
+        let mut full = Vec::new();
+        write_adjudication_metrics(&mut full, &nonce, &record);
+        assert!(full.len() < ADJUDICATION_METRICS_MAX_BYTES);
+        assert!(String::from_utf8_lossy(&full).ends_with(&format!(
+            " {} {}\n",
+            encode_adjudication_nonce(&nonce),
+            encode_adjudication_metrics(b"end")
+        )));
+        for limit in 0..=full.len() {
+            let mut writer = ShortWriter {
+                limit,
+                bytes: Vec::new(),
+                broken: false,
+            };
+            write_adjudication_metrics(&mut writer, &nonce, &record);
+            assert_eq!(writer.bytes, full[..limit]);
+        }
+        let mut broken = ShortWriter {
+            limit: usize::MAX,
+            bytes: Vec::new(),
+            broken: true,
+        };
+        write_adjudication_metrics(&mut broken, &nonce, &record);
+        assert!(broken.bytes.is_empty());
+        let mut oversized = Vec::new();
+        write_adjudication_metrics(&mut oversized, &nonce, &json!({"extra": "x".repeat(2048)}));
+        assert!(oversized.is_empty());
+    }
+
     #[tokio::test]
     async fn adjudication_recovery_generated_outcomes_share_one_correction() {
         // Exhaustive generated outcome pairs exercise the real parser and the
@@ -10357,11 +10589,14 @@ mod tests {
 
     #[tokio::test]
     async fn adjudication_recovery_preparation_refusals_retain_both_causes() {
-        for prompt_bound in [false, true] {
+        for (prompt_bound, outcome) in [false, true]
+            .into_iter()
+            .flat_map(|bound| [(bound, 1), (bound, 2)])
+        {
             let mut fixture = AdjudicationFixture::new(false, 1);
             // Reach the prompt bound within an already supported context window.
             fixture.cfg.model = "openai/gpt-5-mini".into();
-            let server = adjudication_server(vec![fixture.output(2)]).await;
+            let server = adjudication_server(vec![fixture.output(outcome)]).await;
             let client = adjudication_client(&fixture, &server);
             let user = if prompt_bound {
                 "x".repeat(crate::adjudication::MAX_ADJUDICATION_PROMPT_BYTES)
@@ -10388,7 +10623,11 @@ mod tests {
                 error
                     .error
                     .downcast_ref::<crate::adjudication::AdjudicationViolation>(),
-                Some(&crate::adjudication::AdjudicationViolation::ContradictoryRefutation)
+                if outcome == 1 {
+                    None
+                } else {
+                    Some(&crate::adjudication::AdjudicationViolation::ContradictoryRefutation)
+                }
             );
             assert!(format!("{error:#}").contains(if prompt_bound {
                 "finding adjudication correction exceeds its admitted input bound"
