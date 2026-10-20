@@ -3311,7 +3311,22 @@ impl LlmClient {
         let mut usage_accounting_complete = true;
         let mut call_phase = LlmCallPhase::Initial;
         let mut request_user = user.to_owned();
-        let failure = |cause, usage, events: Vec<ModelUsage>, incidents, complete| {
+        let mut last_validation_error = None;
+        let failure = |cause: anyhow::Error,
+                       usage,
+                       events: Vec<ModelUsage>,
+                       incidents,
+                       complete,
+                       validation_error: Option<&anyhow::Error>| {
+            let cause = match validation_error {
+                Some(validation) => {
+                    match validation.downcast_ref::<crate::adjudication::AdjudicationViolation>() {
+                        Some(violation) => cause.context(*violation),
+                        None => cause.context(validation.to_string()),
+                    }
+                }
+                None => cause,
+            };
             let mut error = ModelError::new(cause, usage, complete);
             error.model_usage = events;
             error.model_incidents = incidents;
@@ -3349,6 +3364,7 @@ impl LlmClient {
                         model_usage.clone(),
                         model_incidents.clone(),
                         usage_accounting_complete,
+                        last_validation_error.as_ref(),
                     );
                     let incident = error.incident(ModelIncidentPhase::Scorer);
                     // A refused local admission is not another invalid response.
@@ -3390,6 +3406,7 @@ impl LlmClient {
                                 model_usage.clone(),
                                 model_incidents.clone(),
                                 usage_accounting_complete,
+                                last_validation_error.as_ref(),
                             );
                             error
                                 .model_incidents
@@ -3408,12 +3425,16 @@ impl LlmClient {
                         usage_accounting_complete,
                     });
                 }
-                Err(_) => model_incidents.push(ModelIncident {
-                    phase: ModelIncidentPhase::Scorer,
-                    category: ModelIncidentCategory::InvalidOutput,
-                    recovered: false,
-                    recovery: None,
-                }),
+                Err(cause) => {
+                    eprintln!("postil: finding adjudication validation failed: {cause:#}");
+                    last_validation_error = Some(cause);
+                    model_incidents.push(ModelIncident {
+                        phase: ModelIncidentPhase::Scorer,
+                        category: ModelIncidentCategory::InvalidOutput,
+                        recovered: false,
+                        recovery: None,
+                    });
+                }
             }
             let Some(next_phase) = correction_phase.filter(|_| call == 0) else {
                 break;
@@ -3434,6 +3455,7 @@ impl LlmClient {
                         model_usage.clone(),
                         model_incidents.clone(),
                         usage_accounting_complete,
+                        last_validation_error.as_ref(),
                     );
                     if error.is_deadline_exceeded() {
                         error
@@ -3448,11 +3470,14 @@ impl LlmClient {
             // provider path as the initial call, immediately before contact.
         }
         Err(failure(
-            anyhow!("finding adjudication output did not satisfy its admitted contract"),
+            last_validation_error.unwrap_or_else(|| {
+                anyhow!("finding adjudication output did not satisfy its admitted contract")
+            }),
             usage,
             model_usage,
             model_incidents,
             usage_accounting_complete,
+            None,
         ))
     }
 
@@ -10230,6 +10255,30 @@ mod tests {
             assert!(!error.model_incidents[0].recovered);
             assert!(error.usage_accounting_complete());
             assert!(!error.is_provider());
+            assert!(!error.is_deadline_exceeded());
+            assert!(!error.is_timeout());
+            assert!(
+                error
+                    .error
+                    .downcast_ref::<ProviderAdmissionFailure>()
+                    .is_some()
+            );
+            assert_eq!(
+                error
+                    .error
+                    .downcast_ref::<crate::adjudication::AdjudicationViolation>(),
+                Some(&crate::adjudication::AdjudicationViolation::ContradictoryRefutation)
+            );
+            assert!(format!("{error:#}").contains("no residual admitted capacity"));
+            assert!(format!("{error:#}").contains(match cap {
+                0 => "model provider attempt hard cap",
+                1 => "model provider input hard cap",
+                2 => "model provider output exposure hard cap",
+                3 => "model token exposure exceeded",
+                4 | 5 => "model provider projected cost exposure exceeded",
+                6 => "model token spend exhausted",
+                _ => unreachable!(),
+            }));
             assert_eq!(
                 crate::review::adjudication_failure_finding(&error).title,
                 "Model output could not be validated"
@@ -10258,6 +10307,20 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(error.is_deadline_exceeded());
+            assert!(!error.is_provider());
+            assert!(error.is_timeout());
+            assert!(error.error.downcast_ref::<DeadlineExceeded>().is_some());
+            assert!(format!("{error:#}").contains("LLM total deadline exceeded"));
+            assert_eq!(
+                error
+                    .error
+                    .downcast_ref::<crate::adjudication::AdjudicationViolation>(),
+                (outcome == 2).then_some(
+                    &crate::adjudication::AdjudicationViolation::ContradictoryRefutation
+                )
+            );
+            assert_eq!(error.model_usage.len(), 1);
+            assert!(error.usage_accounting_complete());
             assert_eq!(server.received_requests().await.unwrap().len(), 1);
             assert_eq!(error.usage().cost_micros, Some(3));
             assert!(error.model_incidents.iter().all(|i| !i.recovered));
@@ -10286,14 +10349,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn adjudication_recovery_preparation_refusals_retain_both_causes() {
+        for prompt_bound in [false, true] {
+            let mut fixture = AdjudicationFixture::new(false, 1);
+            // Reach the prompt bound within an already supported context window.
+            fixture.cfg.model = "openai/gpt-5-mini".into();
+            let server = adjudication_server(vec![fixture.output(2)]).await;
+            let client = adjudication_client(&fixture, &server);
+            let user = if prompt_bound {
+                "x".repeat(crate::adjudication::MAX_ADJUDICATION_PROMPT_BYTES)
+            } else {
+                "user".to_owned()
+            };
+            let error = client
+                .adjudicate_findings(
+                    &fixture.cfg.model,
+                    "system",
+                    &user,
+                    1,
+                    if prompt_bound {
+                        Duration::from_secs(60)
+                    } else {
+                        Duration::from_secs(1)
+                    },
+                    |results| fixture.validate(results),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            assert_eq!(
+                error
+                    .error
+                    .downcast_ref::<crate::adjudication::AdjudicationViolation>(),
+                Some(&crate::adjudication::AdjudicationViolation::ContradictoryRefutation)
+            );
+            assert!(format!("{error:#}").contains(if prompt_bound {
+                "finding adjudication correction exceeds its admitted input bound"
+            } else {
+                "finding adjudication has no viable correction slot before its deadline"
+            }));
+            assert!(!error.is_provider());
+            assert!(!error.is_deadline_exceeded());
+            assert!(!error.is_timeout());
+            assert_eq!(error.usage().cost_micros, Some(3));
+            assert_eq!(error.model_usage.len(), 1);
+            assert!(error.usage_accounting_complete());
+            assert_eq!(error.model_incidents.len(), 1);
+            assert_eq!(
+                error.model_incidents[0].category,
+                ModelIncidentCategory::InvalidOutput
+            );
+            assert!(!error.model_incidents[0].recovered);
+            assert_eq!(
+                crate::review::adjudication_failure_finding(&error).title,
+                "Model output could not be validated"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn adjudication_recovery_provider_failures_never_create_another_semantic_attempt() {
-        for repair in [false, true] {
-            let fixture = AdjudicationFixture::new(false, 1);
+        for (repair, context) in [(false, false), (true, false), (true, true)] {
+            let fixture = AdjudicationFixture::new(context, 1);
             let server = MockServer::start().await;
             if repair {
                 Mock::given(method("POST"))
                     .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                        "choices": [{"finish_reason":"stop","message":{"content":fixture.output(2)}}],
+                        "choices": [{"finish_reason":"stop","message":{"content":fixture.output(if context { 4 } else { 2 })}}],
                         "usage":{"prompt_tokens":10,"completion_tokens":2,"cost":0.000003}
                     })))
                     .with_priority(1).up_to_n_times(1).mount(&server).await;
@@ -10317,6 +10439,21 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(error.is_provider());
+            assert!(!error.is_deadline_exceeded());
+            assert!(!error.is_timeout());
+            assert_eq!(
+                error.error.downcast_ref::<ProviderHttpFailure>().unwrap().0,
+                reqwest::StatusCode::FORBIDDEN
+            );
+            assert!(error.error.downcast_ref::<ProviderError>().is_some());
+            if !repair {
+                assert!(
+                    error
+                        .error
+                        .downcast_ref::<crate::adjudication::AdjudicationViolation>()
+                        .is_none()
+                );
+            }
             assert_eq!(
                 server.received_requests().await.unwrap().len(),
                 if repair { 2 } else { 1 }
@@ -10348,6 +10485,17 @@ mod tests {
                     Some(ModelUsagePhase::SemanticRetry)
                 );
                 assert!(!error.usage_accounting_complete());
+                assert_eq!(
+                    error
+                        .error
+                        .downcast_ref::<crate::adjudication::AdjudicationViolation>(),
+                    Some(&if context {
+                        crate::adjudication::AdjudicationViolation::MissingCausalReference
+                    } else {
+                        crate::adjudication::AdjudicationViolation::ContradictoryRefutation
+                    })
+                );
+                assert!(format!("{error:#}").contains("403"));
             }
         }
     }
@@ -10382,6 +10530,7 @@ mod tests {
             error.downcast_ref::<crate::adjudication::AdjudicationViolation>(),
             Some(&crate::adjudication::AdjudicationViolation::ContradictoryRefutation)
         );
+        let expected_cause = error.to_string();
         let server = adjudication_server(vec![fixture.output(0)]).await;
         let client = adjudication_client(&fixture, &server);
         let error = client
@@ -10397,6 +10546,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
         assert_eq!(error.model_incidents.len(), 1);
+        assert!(format!("{error:#}").contains(&expected_cause));
     }
 
     #[test]
