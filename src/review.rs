@@ -2029,13 +2029,14 @@ async fn review_diff_at(
             } else {
                 MAX_LARGE_DIFF_SELECTED_BATCHES
             };
-            let mut batches = diff::spool_model_batches_with_synthesis_budget(
+            let mut batches = diff::spool_model_batches_for_review(
                 &mut prepared,
                 batch_budgets.source,
                 batch_budgets.synthesis,
                 MAX_REVIEW_MANIFEST_BYTES.min(batch_budgets.source / 3),
                 force_model || pr_desc_lines > 0,
                 large_diff_selected_limit,
+                args.bounded,
             )?;
             index.add_change_metadata(batches.metadata_count);
             if batches.count == 0 {
@@ -4894,6 +4895,8 @@ mod tests {
         assert!(envelope.findings.iter().any(|finding| {
             finding.path == crate::envelope::OPERATIONAL_PATH
                 && finding.title == "Large review coverage is incomplete"
+                && finding.body.contains("1 normalized hunk unreviewed")
+                && finding.body.contains("cannot be trusted as a pass")
         }));
         assert_eq!(
             envelope

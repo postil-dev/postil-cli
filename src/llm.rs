@@ -9360,6 +9360,212 @@ mod tests {
     }
 
     #[test]
+    fn source_packing_phase_admission_uses_original_deadline() {
+        let config = Config {
+            scorer_enabled: true,
+            scorer: crate::config::default_scorer_model().to_string(),
+            ..Config::default()
+        };
+        let generator = crate::review::hosted_review_timeout_secs(&config);
+        let limit = crate::review::MAX_LARGE_DIFF_SELECTED_BATCHES
+            .min(max_hosted_review_batches(&config, false).unwrap());
+        let concurrency = crate::review::large_diff_batch_concurrency(&config);
+        assert_eq!(
+            (
+                generator,
+                limit,
+                concurrency,
+                planned_review_models(&config).len()
+            ),
+            (240, 23, 4, 1)
+        );
+        for elapsed in [0, 70, 119, 121, 240] {
+            let started = Instant::now() - Duration::from_secs(elapsed);
+            let mut client = LlmClient::build(
+                &config,
+                format!("fixture-{}", std::process::id()),
+                Duration::from_secs(crate::review::HOSTED_LLM_REQUEST_TIMEOUT_SECS),
+                Some(started + Duration::from_secs(generator)),
+                Some(started + Duration::from_secs(crate::review::HOSTED_LLM_TOTAL_TIMEOUT_SECS)),
+            )
+            .unwrap();
+            client.review_model_timeout = Some(Duration::from_secs(
+                crate::review::LARGE_DIFF_LLM_REQUEST_TIMEOUT_SECS,
+            ));
+            let admitted = client.ensure_hosted_review_schedule(&config, limit, false, concurrency);
+            if elapsed < 120 {
+                admitted.unwrap();
+                let slot = client.scheduled_review_model_slot().unwrap();
+                assert!(slot >= RETRY_ATTEMPT_RESERVE);
+                assert!(
+                    slot.as_secs()
+                        <= (generator
+                            - elapsed
+                            - crate::review::HOSTED_REVIEW_SCHEDULING_RESERVE_SECS)
+                            / 6
+                );
+            } else {
+                let error = admitted.unwrap_err();
+                assert!(format!("{error:#}").contains(if elapsed == 240 {
+                    "deadline has already elapsed"
+                } else {
+                    "no provider request was made"
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn packed_source_bounds_do_not_admit_oversized_decorated_requests() {
+        let config = Config {
+            model: "openai/gpt-5-mini".into(),
+            scorer_enabled: false,
+            uncertainty_resolution: false,
+            concise_findings: false,
+            ..Config::default()
+        };
+        let mut client = LlmClient::build(
+            &config,
+            format!("fixture-{}", std::process::id()),
+            Duration::from_secs(1),
+            None,
+            None,
+        )
+        .unwrap();
+        client.request_decorations.hosted_price_bounds = Some(Arc::new(HashMap::from([(
+            config.model.clone(),
+            ModelPriceBound {
+                model: config.model.clone(),
+                input_micros_per_million_tokens: 1,
+                output_micros_per_million_tokens: 1,
+            },
+        )])));
+        let title = "Synthetic \"title\" 界";
+        let context = crate::prompt::PrContext {
+            repo: Some("example/project"),
+            title: Some(title),
+            body: Some("Synthetic body with \\ and Unicode"),
+            incremental: false,
+            content_policy: false,
+            change_context: None,
+        };
+        let system = crate::prompt::system_prompt(&config, trusted_date());
+        for budget in [4096, 32768] {
+            let source = format!(
+                "diff --git a/src/payload.rs b/src/payload.rs\n--- a/src/payload.rs\n+++ b/src/payload.rs\n@@ -0,0 +1 @@\n+{}\n",
+                "界\0\"\\".repeat(budget / 12)
+            );
+            let parsed = crate::diff::parse(&source);
+            let plan = crate::diff::render_review_batches(&parsed, &[], &[], budget, 1024);
+            assert!(!plan.incomplete);
+            for batch in plan.batches {
+                assert!(serde_json::to_vec(&batch).unwrap().len() - 2 <= budget);
+                let user = crate::prompt::user_prompt(&context, &batch, config.max_findings);
+                let first = vec![format!(
+                    "{user}\nSynthetic feedback: preserve exact citation grounding."
+                )];
+                let later = vec![format!("{user}\nSynthetic later-request context.")];
+                let outputs = [REVIEW_MAX_TOKENS];
+                let preflight = |first_users: &[String], later_users: &[String]| {
+                    client.preflight_review_plan_with_output_limits(
+                        &config,
+                        1,
+                        &system,
+                        ReviewPreflightPrompts {
+                            first_users,
+                            later_users,
+                            output_tokens: &outputs,
+                            scorer_system: "unused",
+                            current_utc_date: trusted_date(),
+                        },
+                        ReviewPlanSchedule {
+                            planner: None,
+                            batch_concurrency: 1,
+                        },
+                    )
+                };
+                preflight(&first, &later).unwrap();
+                let oversized = vec![format!(
+                    "{user}\nSynthetic feedback: {}",
+                    "\0".repeat(32768)
+                )];
+                for (first_users, later_users) in [(&oversized, &later), (&first, &oversized)] {
+                    let error = preflight(first_users, later_users).unwrap_err();
+                    assert!(
+                        error.downcast_ref::<ReviewContextExceeded>().is_some(),
+                        "{error:#}"
+                    );
+                }
+                let body = client.request_body(
+                    &config.model,
+                    &system,
+                    &first[0],
+                    REVIEW_MAX_TOKENS,
+                    0.1,
+                    LlmPhase::Review,
+                );
+                assert_eq!(
+                    client
+                        .planned_request_bytes(
+                            &config.model,
+                            &system,
+                            &first[0],
+                            REVIEW_MAX_TOKENS,
+                            0.1,
+                            LlmPhase::Review
+                        )
+                        .unwrap(),
+                    serde_json::to_vec(&body).unwrap().len()
+                );
+                // The independent output-retry expansion remains subject to the same context check.
+                let initial_bytes = client
+                    .planned_request_bytes(
+                        &config.model,
+                        &system,
+                        &user,
+                        REVIEW_MAX_TOKENS,
+                        0.1,
+                        LlmPhase::Review,
+                    )
+                    .unwrap();
+                let retry_user = format!(
+                    "{user}{}",
+                    "x".repeat(
+                        conservative_context_tokens(&config.model)
+                            - REVIEW_MAX_OUTPUT_TOKENS as usize
+                            + 1
+                            - initial_bytes
+                    )
+                );
+                client
+                    .ensure_review_request_fits_context(
+                        &config.model,
+                        &client.request_body(
+                            &config.model,
+                            &system,
+                            &retry_user,
+                            REVIEW_MAX_TOKENS,
+                            0.1,
+                            LlmPhase::Review,
+                        ),
+                        REVIEW_MAX_TOKENS,
+                    )
+                    .unwrap();
+                assert!(
+                    client
+                        .planned_review_request_exposure(
+                            &config.model,
+                            &system,
+                            &retry_user,
+                            REVIEW_MAX_TOKENS
+                        )
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn hosted_preflight_counts_exact_hostile_json_expansion() {
         let config = Config {
             model: "provider/model".into(),
