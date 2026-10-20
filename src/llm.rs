@@ -10107,7 +10107,7 @@ mod tests {
                 for first in 0..5 {
                     for second in 0..5 {
                         let first_valid = first == 0 || (first == 4 && !context);
-                        let eligible = first == 1 || first == 2 || (first == 4 && context);
+                        let eligible = (1..=3).contains(&first) || (first == 4 && context);
                         let second_valid = second == 0 || (second == 4 && !context);
                         let server = adjudication_server(vec![
                             fixture.output(first),
@@ -10197,9 +10197,9 @@ mod tests {
 
     #[tokio::test]
     async fn adjudication_recovery_residual_caps_are_atomic_and_do_not_change_initial_admission() {
-        for cap in 0..7 {
+        for (cap, outcome) in (0..7).flat_map(|cap| [(cap, 2), (cap, 3)]) {
             let fixture = AdjudicationFixture::new(false, 1);
-            let server = adjudication_server(vec![fixture.output(2)]).await;
+            let server = adjudication_server(vec![fixture.output(outcome)]).await;
             let mut client = adjudication_client(&fixture, &server);
             client.request_decorations.hosted_price_bounds = Some(Arc::new(HashMap::from([(
                 fixture.cfg.model.clone(),
@@ -10267,7 +10267,11 @@ mod tests {
                 error
                     .error
                     .downcast_ref::<crate::adjudication::AdjudicationViolation>(),
-                Some(&crate::adjudication::AdjudicationViolation::ContradictoryRefutation)
+                Some(&if outcome == 3 {
+                    crate::adjudication::AdjudicationViolation::UnknownCandidateIdentity
+                } else {
+                    crate::adjudication::AdjudicationViolation::ContradictoryRefutation
+                })
             );
             assert!(format!("{error:#}").contains("no residual admitted capacity"));
             assert!(format!("{error:#}").contains(match cap {
@@ -10288,7 +10292,7 @@ mod tests {
 
     #[tokio::test]
     async fn adjudication_recovery_deadline_and_cancellation_never_accept_an_application() {
-        for outcome in [0, 2] {
+        for outcome in [0, 2, 3] {
             let fixture = AdjudicationFixture::new(false, 1);
             let server = adjudication_server(vec![fixture.output(outcome)]).await;
             let client = adjudication_client(&fixture, &server);
@@ -10315,9 +10319,12 @@ mod tests {
                 error
                     .error
                     .downcast_ref::<crate::adjudication::AdjudicationViolation>(),
-                (outcome == 2).then_some(
-                    &crate::adjudication::AdjudicationViolation::ContradictoryRefutation
-                )
+                match outcome {
+                    2 => Some(&crate::adjudication::AdjudicationViolation::ContradictoryRefutation),
+                    3 =>
+                        Some(&crate::adjudication::AdjudicationViolation::UnknownCandidateIdentity),
+                    _ => None,
+                }
             );
             assert_eq!(error.model_usage.len(), 1);
             assert!(error.usage_accounting_complete());
@@ -10409,13 +10416,18 @@ mod tests {
 
     #[tokio::test]
     async fn adjudication_recovery_provider_failures_never_create_another_semantic_attempt() {
-        for (repair, context) in [(false, false), (true, false), (true, true)] {
+        for (repair, context, unknown) in [
+            (false, false, false),
+            (true, false, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
             let fixture = AdjudicationFixture::new(context, 1);
             let server = MockServer::start().await;
             if repair {
                 Mock::given(method("POST"))
                     .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                        "choices": [{"finish_reason":"stop","message":{"content":fixture.output(if context { 4 } else { 2 })}}],
+                        "choices": [{"finish_reason":"stop","message":{"content":fixture.output(if unknown { 3 } else if context { 4 } else { 2 })}}],
                         "usage":{"prompt_tokens":10,"completion_tokens":2,"cost":0.000003}
                     })))
                     .with_priority(1).up_to_n_times(1).mount(&server).await;
@@ -10489,7 +10501,9 @@ mod tests {
                     error
                         .error
                         .downcast_ref::<crate::adjudication::AdjudicationViolation>(),
-                    Some(&if context {
+                    Some(&if unknown {
+                        crate::adjudication::AdjudicationViolation::UnknownCandidateIdentity
+                    } else if context {
                         crate::adjudication::AdjudicationViolation::MissingCausalReference
                     } else {
                         crate::adjudication::AdjudicationViolation::ContradictoryRefutation
@@ -10510,6 +10524,16 @@ mod tests {
             Some(&crate::adjudication::AdjudicationViolation::MissingCausalReference)
         );
         let fixture = AdjudicationFixture::new(false, 0);
+        let unknown = serde_json::from_str::<Vec<AdjudicationResult>>(&fixture.output(3)).unwrap();
+        let error = fixture.validate(unknown).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<crate::adjudication::AdjudicationViolation>(),
+            Some(&crate::adjudication::AdjudicationViolation::UnknownCandidateIdentity)
+        );
+        assert_eq!(
+            error.to_string(),
+            "adjudication returned an unknown candidate identity"
+        );
         let refuted = serde_json::from_str::<Vec<AdjudicationResult>>(&fixture.output(2)).unwrap();
         let error = crate::adjudication::validate_results(
             "test-snapshot",

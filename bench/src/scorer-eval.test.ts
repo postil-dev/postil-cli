@@ -378,6 +378,8 @@ function genericOpenAiCompatibleRequest(
   };
 }
 
+const ADJUDICATION_CORRECTION_SUFFIX = "\n\nReturn the complete adjudication JSON array for the original candidate IDs. Correct the rejected output using only the supplied evidence. A refutation needs candidate-specific contradictory evidence, not its own citation or unsupported prose. A context-anchored confirmation needs an exact causal change reference. Preserve all structural, scope and publication rules. Never invent evidence or references, silently drop a candidate, or fabricate a verdict.";
+
 function adjudicationResponse(body: string): string | null {
   let request: {
     messages?: Array<{ role?: string; content?: string }>;
@@ -392,7 +394,9 @@ function adjudicationResponse(body: string): string | null {
   ) ?? false;
   if (!isAdjudication) return null;
   const user = request.messages?.findLast((message) => message.role === "user")?.content ?? "{}";
-  const payload = JSON.parse(user) as {
+  const originalUser = user.endsWith(ADJUDICATION_CORRECTION_SUFFIX)
+    ? user.slice(0, -ADJUDICATION_CORRECTION_SUFFIX.length) : user;
+  const payload = JSON.parse(originalUser) as {
     candidates?: Array<{
       candidateId?: string;
       title?: string;
@@ -2387,13 +2391,49 @@ describe("finite adjudication provenance", () => {
     expect(adjudicationOutput(events.map(provenanceLine).join("\n"))?.records).toEqual(events);
   });
 
+  test("mock accepts only original JSON or its exact correction suffix", () => {
+    const request = (user: string) => JSON.stringify({ messages: [
+      { role: "system", content: "Postil's single finding adjudicator" }, { role: "user", content: user },
+    ] });
+    expect(adjudicationResponse(request('{"candidates":[]}'))).toBe("[]");
+    expect(adjudicationResponse(request('{"candidates":[]}' + ADJUDICATION_CORRECTION_SUFFIX))).toBe("[]");
+    for (const suffix of [" arbitrary", ADJUDICATION_CORRECTION_SUFFIX + " extra", ADJUDICATION_CORRECTION_SUFFIX.repeat(2)]) {
+      expect(() => adjudicationResponse(request('{"candidates":[]}' + suffix))).toThrow();
+    }
+  });
+
+  test("accepts exactly the bounded call phases alongside legacy records", () => {
+    const phased = (call: number, callPhase: unknown) => {
+      const { attempt, call: _, ...rest } = provenanceRecord();
+      return { attempt, call, callPhase, ...rest };
+    };
+    for (const record of [phased(1, "initial"), phased(2, "schema-repair"), phased(2, "semantic-retry")]) {
+      const line = provenanceLine(record);
+      expect(adjudicationOutput(line)).toEqual({ records: [record], malformed: 0, duplicates: 0, omitted: 0 });
+      for (const bad of [
+        line.replace('"callPhase":', '"callPhase":"initial","callPhase":'),
+        line.replace('"version":1', '"other":0,"version":1'),
+      ]) expect(adjudicationOutput(bad)?.malformed).toBe(1);
+    }
+    for (const record of [phased(1, "semantic-retry"), phased(1, "schema-repair"), phased(2, "initial"),
+      phased(3, "semantic-retry"), phased(2, null), phased(1, "unknown"), phased(1, {}),
+      provenanceRecord({ call: 2 }), provenanceRecord({ callPhase: undefined, call: 2 })]) {
+      expect(adjudicationOutput(provenanceLine(record))?.records).toEqual([]);
+      expect(adjudicationOutput(provenanceLine(record))?.malformed).toBe(1);
+    }
+    const line = provenanceLine(phased(2, "semantic-retry"));
+    expect(adjudicationOutput(`${line}\n${line}`)).toMatchObject({ duplicates: 1, malformed: 0 });
+    expect(adjudicationOutput(`${line}\n`.repeat(40))).toMatchObject({ duplicates: 31, omitted: 8, malformed: 0 });
+  });
+
   test("real child preserves baseline behavior with enabled counted scorer and mock publication", async () => {
     const baseBinary = process.env.POSTIL_PROVENANCE_BASE_BIN;
     const binaries = baseBinary ? [baseBinary, postilBinaryPath()] : [postilBinaryPath()];
     const hostile = String.fromCharCode(115, 107, 45) + crypto.randomUUID();
     const modes = ["accepted", "fenced", "noArray", "unclosedArray", "jsonSyntax", "resultCountMismatch",
       "missingKnownField", "unknownField", "invalidEnum", "endpointMalformed", "emptyRecovered",
-      "missingChoicesRecovered", "emptyTerminal", "length", "tool_calls", "absentFinish"];
+      "missingChoicesRecovered", "emptyTerminal", "length", "tool_calls", "absentFinish",
+      "unknownRecovered", "unknownTerminal", "syntaxThenUnknown"];
     const keyName = "POSTIL_PROVENANCE_LOCAL_KEY";
     const previous = process.env[keyName];
     process.env[keyName] = crypto.randomUUID();
@@ -2417,6 +2457,11 @@ describe("finite adjudication provenance", () => {
         if (mode === "missingChoicesRecovered" && adjudicationCalls === 1) {
           res.writeHead(200); res.end(JSON.stringify({ usage: { prompt_tokens: 30, completion_tokens: 10, cost: 0.000045 } })); return;
         }
+        if (mode === "unknownTerminal" || mode === "syntaxThenUnknown" && adjudicationCalls === 2 ||
+          mode === "unknownRecovered" && adjudicationCalls === 1) {
+          content = JSON.stringify([{ ...JSON.parse(adjudication)[0], candidateId: "unknown-candidate" }]);
+        }
+        if (mode === "syntaxThenUnknown" && adjudicationCalls === 1) content = "no array";
         if (mode === "noArray") content = `refusal ${hostile} https://example.invalid/${hostile}`;
         if (mode === "unclosedArray") content = "[";
         if (mode === "jsonSyntax") content = "[?]";
@@ -2446,7 +2491,9 @@ describe("finite adjudication provenance", () => {
             binary, runRoot, apiBase, keyName, pricing);
           const artifacts = join(runRoot, safeSegment(TEST_SCORER_MODEL), "repeat-1", c.id, "artifacts");
           const envelope = envelopeV1.parse(JSON.parse(await readFile(join(artifacts, "stdout.json"), "utf8")));
-          const success = ["accepted", "fenced", "emptyRecovered", "missingChoicesRecovered"].includes(mode);
+          const success = ["accepted", "fenced", "emptyRecovered", "missingChoicesRecovered", "unknownRecovered"].includes(mode);
+          const corrected = ["noArray", "unclosedArray", "jsonSyntax", "resultCountMismatch",
+            "missingKnownField", "unknownField", "invalidEnum", "unknownRecovered", "unknownTerminal", "syntaxThenUnknown"].includes(mode);
           expect(evaluation.envelopeProduced).toBe(true);
           expect(envelope.findings.some((finding) => finding.path === ".postil/model-output")).toBe(!success);
           const publication = JSON.parse(await readFile(join(artifacts, "publication-telemetry.json"), "utf8"));
@@ -2464,8 +2511,40 @@ describe("finite adjudication provenance", () => {
           else {
             expect(projection?.malformed).toBe(0);
             expect(projection?.records[0]?.event).toBe("callStarted");
-            expect(projection?.records.every((record) => record.call === 1)).toBe(true);
-            const expectedCode = success ? "accepted" :
+            const records = projection!.records;
+            expect(projection?.duplicates).toBe(0);
+            expect(projection?.omitted).toBe(0);
+            const phase = ["unknownRecovered", "unknownTerminal"].includes(mode) ? "semantic-retry" : "schema-repair";
+            expect(records.filter((record) => record.event === "callStarted")
+              .map(({ call, callPhase }) => ({ call, callPhase }))).toEqual(corrected
+              ? [{ call: 1, callPhase: "initial" }, { call: 2, callPhase: phase }]
+              : [{ call: 1, callPhase: "initial" }]);
+            expect(records.every((record) => record.call === 1 ? record.callPhase === "initial"
+              : corrected && record.call === 2 && record.callPhase === phase)).toBe(true);
+            const transportRecovered = ["emptyRecovered", "missingChoicesRecovered"].includes(mode);
+            const expectedCalls = corrected || transportRecovered || mode === "emptyTerminal" ? 2 : 1;
+            expect(adjudicationCalls).toBe(expectedCalls);
+            const adjudicationRequests = requests.map((body) => JSON.parse(body))
+              .filter((body) => body.messages.some((message: { content?: string }) =>
+                message.content?.includes("Postil's single finding adjudicator")));
+            expect(adjudicationRequests.length).toBe(expectedCalls);
+            for (const request of adjudicationRequests.slice(1)) {
+              const expected = structuredClone(adjudicationRequests[0]);
+              if (corrected) expected.messages.findLast((message: { role?: string }) => message.role === "user").content += ADJUDICATION_CORRECTION_SUFFIX;
+              expect(request).toEqual(expected);
+            }
+            expect(evaluation.diagnostics?.adjudication.attempts).toBe(expectedCalls);
+            expect(evaluation.diagnostics?.adjudication.validUsageAttempts).toBe(mode === "endpointMalformed" ? 0 : expectedCalls);
+            expect(evaluation.diagnostics?.adjudication.exactCostAttempts).toBe(mode === "endpointMalformed" ? 0 : expectedCalls);
+            const usage = envelope.modelUsage?.filter((usage) => usage.role === "findingScorer") ?? [];
+            expect(usage.length).toBe(expectedCalls + scorerCalls);
+            if (mode !== "endpointMalformed") {
+              expect(usage.every((entry) => entry.accountingComplete)).toBe(true);
+              expect(usage.reduce((sum, entry) => sum + entry.promptTokens, 0)).toBe(30 * (expectedCalls + scorerCalls));
+              expect(usage.reduce((sum, entry) => sum + entry.completionTokens, 0)).toBe(10 * (expectedCalls + scorerCalls));
+              expect(usage.reduce((sum, entry) => sum + entry.costMicros!, 0)).toBe(45 * (expectedCalls + scorerCalls));
+            }
+            const expectedCode = success || ["unknownTerminal", "syntaxThenUnknown"].includes(mode) ? "accepted" :
               mode === "emptyTerminal" ? "emptyContent" :
               ["length", "tool_calls", "absentFinish"].includes(mode) ? "nonterminalStop" : mode;
             expect(projection?.records.at(-1)?.code).toBe(expectedCode);
@@ -2473,7 +2552,7 @@ describe("finite adjudication provenance", () => {
               expect(projection?.records.at(-1)?.finish).toBe(mode === "absentFinish" ? "absent" : mode);
               expect(adjudicationCalls).toBe(1);
             }
-            expect(projection?.records.at(-1)?.event).toBe(success ? "parsed" :
+            expect(projection?.records.at(-1)?.event).toBe(success || ["unknownTerminal", "syntaxThenUnknown"].includes(mode) ? "parsed" :
               ["endpointMalformed", "emptyTerminal", "length", "tool_calls", "absentFinish"].includes(mode) ? "callFailed" : "parserRejected");
             expect(JSON.stringify(projection).includes(hostile)).toBe(false);
             if (mode === "emptyRecovered" || mode === "missingChoicesRecovered") {

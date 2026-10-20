@@ -17,6 +17,7 @@ pub(crate) const MAX_ADJUDICATION_OUTPUT_TOKENS: u32 = 8_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AdjudicationViolation {
+    UnknownCandidateIdentity,
     ContradictoryRefutation,
     MissingCausalReference,
 }
@@ -24,6 +25,7 @@ pub(crate) enum AdjudicationViolation {
 impl std::fmt::Display for AdjudicationViolation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
+            Self::UnknownCandidateIdentity => "adjudication returned an unknown candidate identity",
             Self::ContradictoryRefutation => {
                 "refuted adjudication must cite candidate-specific contradictory evidence"
             }
@@ -1200,7 +1202,7 @@ fn validate_result_structure(
     for result in results {
         ensure!(
             expected.contains(&result.candidate_id),
-            "adjudication returned an unknown candidate identity"
+            AdjudicationViolation::UnknownCandidateIdentity
         );
         ensure!(
             seen.insert(result.candidate_id.clone()),

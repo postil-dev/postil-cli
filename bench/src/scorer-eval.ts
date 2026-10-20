@@ -237,7 +237,8 @@ const OUTPUT_CODES = {
 type OutputCount = number | "overflow" | null;
 export interface AdjudicationOutputRecord {
   attempt: number | null; // Local to this adjudication call, never a proxy ordinal.
-  call: 1; // One adjudication call per review child; not a proxy ordinal.
+  call: 1 | 2; // Initial call or its one shared correction; not a proxy ordinal.
+  callPhase?: "initial" | "schema-repair" | "semantic-retry";
   code: string;
   event: keyof typeof OUTPUT_CODES;
   expected: OutputCount;
@@ -276,10 +277,13 @@ export function adjudicationOutput(stderr: string): AdjudicationOutput | undefin
     try {
       const value = JSON.parse(raw);
       if (!value || typeof value !== "object" || Array.isArray(value)) throw 0;
-      const { attempt, call, code, event, expected, field, finish, observed, phase, stage, version } = value;
+      const { attempt, call, callPhase, code, event, expected, field, finish, observed, phase, stage, version } = value;
+      const phased = Object.hasOwn(value, "callPhase");
+      if (phased ? !(call === 1 && callPhase === "initial" ||
+        call === 2 && (callPhase === "schema-repair" || callPhase === "semantic-retry")) : call !== 1) throw 0;
       if (version !== 1 || phase !== "adjudication" || typeof event !== "string" ||
         typeof stage !== "string" || typeof code !== "string" || !Object.hasOwn(OUTPUT_CODES, event) ||
-        call !== 1 || !ordinal(attempt, 13) || !count(expected) || !count(observed) ||
+        !ordinal(attempt, 13) || !count(expected) || !count(observed) ||
         !(field === null || OUTPUT_FIELDS.includes(field)) ||
         !(finish === null || ["stop", "length", "tool_calls", "content_filter", "error", "reported", "absent", "end_turn", "stop_sequence"].includes(finish))) throw 0;
       const stages = OUTPUT_CODES[event as keyof typeof OUTPUT_CODES] as Record<string, readonly string[]>;
@@ -299,7 +303,7 @@ export function adjudicationOutput(stderr: string): AdjudicationOutput | undefin
       if (code !== "nonterminalStop" && finish !== null) throw 0;
       if (code === "nonterminalStop" && finish === null) throw 0;
       const record: AdjudicationOutputRecord = {
-        attempt, call, code, event, expected, field, finish, observed, phase, stage, version,
+        attempt, call, ...(phased ? { callPhase } : {}), code, event, expected, field, finish, observed, phase, stage, version,
       };
       if (JSON.stringify(record) !== raw) throw 0;
       if (accepted.has(raw)) duplicates = boundedIncrement(duplicates);
