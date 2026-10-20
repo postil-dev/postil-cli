@@ -2749,6 +2749,20 @@ async fn review_diff_at(
                                             &adjudication_user,
                                             all_adjudication_candidates.len(),
                                             Duration::from_secs(FINDING_ADJUDICATION_TIMEOUT_SECS),
+                                            |results| {
+                                                apply_adjudication_results(
+                                                    &snapshot_id,
+                                                    &all_adjudication_candidates,
+                                                    &candidate_ids,
+                                                    results,
+                                                    diff_snapshot.as_str(),
+                                                    &diff_receipt,
+                                                    receipt,
+                                                    fresh_candidate_count,
+                                                    cfg,
+                                                    &index,
+                                                )
+                                            },
                                         )
                                         .await,
                                 ),
@@ -2771,69 +2785,22 @@ async fn review_diff_at(
                                     model_incidents.extend(adjudicated.model_incidents);
                                     usage_accounting_complete &=
                                         adjudicated.usage_accounting_complete;
-                                    match crate::adjudication::apply_results(
-                                        &snapshot_id,
-                                        all_adjudication_candidates.clone(),
-                                        candidate_ids.clone(),
-                                        adjudicated.results,
-                                        diff_snapshot.as_str(),
-                                        &diff_receipt,
-                                        receipt,
-                                    ).and_then(|mut application| {
-                                        suppress_fresh_unresolved_repository_claims(
-                                            &mut application,
-                                            fresh_candidate_count,
+                                    let application = adjudicated.application;
+                                    if !application.recovered_duplicate_indices.is_empty() {
+                                        eprintln!(
+                                            "postil: repaired {} non-confirmed adjudication duplicate reference(s) to unresolved; applying candidate publication policy",
+                                            application.recovered_duplicate_indices.len()
                                         );
-                                        suppress_fresh_lockfile_platform_claims(
-                                            &mut application,
-                                            fresh_candidate_count,
-                                            &index,
-                                        );
-                                        anyhow::ensure!(
-                                            application.invalid_refutation_indices.iter().all(|candidate_index| {
-                                                cfg.scorer_enabled()
-                                                    && *candidate_index < fresh_candidate_count
-                                                    && application.kept_indices.contains(candidate_index)
-                                            }),
-                                            "refuted adjudication must cite candidate-specific contradictory evidence"
-                                        );
-                                        Ok(application)
-                                    }) {
-                                        Ok(application) => {
-                                            if !application.recovered_duplicate_indices.is_empty() {
-                                                eprintln!(
-                                                    "postil: repaired {} non-confirmed adjudication duplicate reference(s) to unresolved; applying candidate publication policy",
-                                                    application.recovered_duplicate_indices.len()
-                                                );
-                                                model_incidents.push(ModelIncident {
-                                                    phase: ModelIncidentPhase::Scorer,
-                                                    category: ModelIncidentCategory::InvalidOutput,
-                                                    recovered: true,
-                                                    recovery: Some(crate::envelope::ModelIncidentRecovery::Repair),
-                                                });
-                                            }
-                                            application
-                                        },
-                                        Err(error) => {
-                                            adjudication_incomplete = true;
-                                            review_trust = filter::ReviewTrust::Failed;
-                                            eprintln!(
-                                                "postil: finding adjudication validation failed; preserving all generated findings: {error:#}"
-                                            );
-                                            model_incidents.push(ModelIncident {
-                                                phase: ModelIncidentPhase::Scorer,
-                                                category: ModelIncidentCategory::InvalidOutput,
-                                                recovered: false,
-                                                recovery: None,
-                                            });
-                                            adjudication_failure = Some(fail_closed_finding(
-                                                "finding adjudication output did not satisfy its admitted contract",
-                                            ));
-                                            preserve_unadjudicated_findings(
-                                                all_adjudication_candidates,
-                                            )
-                                        }
+                                        model_incidents.push(ModelIncident {
+                                            phase: ModelIncidentPhase::Scorer,
+                                            category: ModelIncidentCategory::InvalidOutput,
+                                            recovered: true,
+                                            recovery: Some(
+                                                crate::envelope::ModelIncidentRecovery::Repair,
+                                            ),
+                                        });
                                     }
+                                    application
                                 }
                                 Some(Err(error)) => {
                                     adjudication_incomplete = true;
@@ -2845,15 +2812,8 @@ async fn review_diff_at(
                                     model_usage.extend_from_slice(error.model_usage());
                                     model_incidents.extend_from_slice(error.model_incidents());
                                     usage_accounting_complete &= error.usage_accounting_complete();
-                                    adjudication_failure = Some(if error.is_provider() {
-                                        crate::envelope::provider_error_finding(
-                                            "finding adjudication did not complete",
-                                        )
-                                    } else {
-                                        fail_closed_finding(
-                                            "finding adjudication output did not satisfy its admitted contract",
-                                        )
-                                    });
+                                    adjudication_failure =
+                                        Some(adjudication_failure_finding(&error));
                                     preserve_unadjudicated_findings(all_adjudication_candidates)
                                 }
                                 None => {
@@ -3917,6 +3877,56 @@ fn promote_incomplete_adjudication_receipts(
             finding.severity = crate::envelope::Severity::Error;
         }
     }
+}
+
+pub(crate) fn adjudication_failure_finding(error: &crate::llm::ModelError) -> Finding {
+    if classify_exhausted_scorer_failure(error.model_incidents(), error.is_provider())
+        == ReviewFailureKind::Provider
+    {
+        crate::envelope::provider_error_finding("finding adjudication did not complete")
+    } else {
+        fail_closed_finding("finding adjudication output did not satisfy its admitted contract")
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_adjudication_results(
+    snapshot_id: &str,
+    candidates: &[Finding],
+    candidate_ids: &[String],
+    results: Vec<crate::adjudication::AdjudicationResult>,
+    corpus: &str,
+    diff_receipt: &crate::adjudication::DiffCorpusReceipt,
+    receipt: &crate::envelope::RepositorySearchReceipt,
+    fresh_candidate_count: usize,
+    cfg: &Config,
+    index: &diff::DiffIndex,
+) -> Result<crate::adjudication::AdjudicationApplication> {
+    crate::adjudication::apply_results(
+        snapshot_id,
+        candidates.to_vec(),
+        candidate_ids.to_vec(),
+        results,
+        corpus,
+        diff_receipt,
+        receipt,
+    )
+    .and_then(|mut application| {
+        suppress_fresh_unresolved_repository_claims(&mut application, fresh_candidate_count);
+        suppress_fresh_lockfile_platform_claims(&mut application, fresh_candidate_count, index);
+        anyhow::ensure!(
+            application
+                .invalid_refutation_indices
+                .iter()
+                .all(|candidate_index| {
+                    cfg.scorer_enabled()
+                        && *candidate_index < fresh_candidate_count
+                        && application.kept_indices.contains(candidate_index)
+                }),
+            crate::adjudication::AdjudicationViolation::ContradictoryRefutation
+        );
+        Ok(application)
+    })
 }
 
 fn preserve_unadjudicated_findings(

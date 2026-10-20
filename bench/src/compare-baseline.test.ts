@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -48,7 +49,13 @@ import {
   type ProviderContractEvidence,
 } from "./livemodels-score";
 
-test("EU baseline preserves its fixture identity but is stale for the calibration evaluator", async () => {
+const historicalImport = "7ae07f4c2c62256d837860deb76e498706e3ac5b";
+const historicalArtifact = (path: string): string => execFileSync(
+  "git", ["show", `${historicalImport}:${path}`],
+  { cwd: resolve(import.meta.dir, "../.."), encoding: "utf8" },
+);
+
+test("retained EU baseline preserves historical identity and rejects the current corpus", async () => {
   const baseline = parseBaselineFile(JSON.parse(
     await readFile(resolve(import.meta.dir, "..", "baseline.json"), "utf8"),
   ));
@@ -56,7 +63,9 @@ test("EU baseline preserves its fixture identity but is stale for the calibratio
     .update(JSON.stringify(cases.map((input) => benchmarkCase.parse(input))))
     .digest("hex");
 
-  expect(baseline.corpus.fixtureCorpusSha256).toBe(fixtureCorpusSha256);
+  const historical = parseBaselineFile(JSON.parse(historicalArtifact("bench/baseline.json")));
+  expect(baseline.corpus).toEqual(historical.corpus);
+  expect(baseline.corpus.fixtureCorpusSha256).not.toBe(fixtureCorpusSha256);
   expect(baseline.corpus.evaluatorSha256).not.toBe(await evaluatorSourceSha256());
 });
 
@@ -115,12 +124,12 @@ test("release prerequisite rejects an unpopulated US baseline before attestation
   }
 });
 
-test("attested US calibration binds its source and route while the embedded provider stays on Azure/EU", async () => {
+test("retained attested US calibration binds its source and route while the embedded provider stays on Azure/EU", async () => {
   const root = resolve(import.meta.dir, "..", "..");
   const [usBytes, euBytes, attestationBytes, us, eu] = await Promise.all([
-    readFile(resolve(root, "bench/baseline-us.json"), "utf8"),
-    readFile(resolve(root, "bench/baseline.json"), "utf8"),
-    readFile(resolve(root, "bench/baseline-us.attestation.json"), "utf8"),
+    historicalArtifact("bench/baseline-us.json"),
+    historicalArtifact("bench/baseline.json"),
+    historicalArtifact("bench/baseline-us.attestation.json"),
     screeningProfileMetadata(resolve(root, "provisional-models-us.json")),
     screeningProfileMetadata(resolve(root, "provisional-models-eu.json")),
   ]);
@@ -163,7 +172,7 @@ test("attested US calibration binds its source and route while the embedded prov
   expect(await readFile(resolve(root, "provisional-models.json"), "utf8")).toBe(await readFile(resolve(root, "provisional-models-eu.json"), "utf8"));
   expect(usBaseline.corpus.fixtureCorpusSha256).toBe(euBaseline.corpus.fixtureCorpusSha256);
   expect(usBaseline.corpus.evaluatorSha256).not.toBe(euBaseline.corpus.evaluatorSha256);
-  expect(usBaseline.corpus.evaluatorSha256).toBe(await evaluatorSourceSha256());
+  expect(usBaseline.corpus.evaluatorSha256).not.toBe(await evaluatorSourceSha256());
   expect(eu.upstreamProviderRoute).toBe("azure/eu");
   expect(us.upstreamProviderRoute).toBe("azure/us");
   for (const profile of [us, eu]) {
@@ -322,7 +331,7 @@ function cloneReport(report: LiveReportForComparison): LiveReportForComparison {
   return structuredClone(report);
 }
 
-async function inputBoundReport(): Promise<LiveReportForComparison> {
+async function inputBoundReport(screeningProfilePath = resolve(import.meta.dir, "..", "..", "provisional-models.json")): Promise<LiveReportForComparison> {
   const report = fakeReport();
   const parsedCases = cases.map((input) => benchmarkCase.parse(input));
   let detected = 0;
@@ -346,7 +355,6 @@ async function inputBoundReport(): Promise<LiveReportForComparison> {
       exitCode: caseDetected && finding?.severity === "error" ? 1 : 0,
     };
   });
-  const screeningProfilePath = resolve(import.meta.dir, "..", "..", "provisional-models.json");
   const [binary, evaluatorSha256, profile] = await Promise.all([
     readFile(process.execPath),
     evaluatorSourceSha256(),
@@ -636,6 +644,77 @@ function fakeReleaseCohort(reports: readonly LiveReportForComparison[]): {
     expectedRunIds: slots.map((slot) => slot.runId),
   };
 }
+
+test("recording replaces a populated historical baseline only after complete current-input cohort verification", async () => {
+  const directory = await mkdtemp(resolve(tmpdir(), "postil-populated-record-"));
+  try {
+    const profilePath = resolve(import.meta.dir, "../..", "provisional-models-us.json");
+    const original = await inputBoundReport(profilePath);
+    const reports = Array.from({ length: 10 }, (_, index) => {
+      const report = cloneReport(original);
+      report.summary.runId = `recalibration-${index + 1}`;
+      report.summary.ranAt = `2026-08-25T00:10:0${index}.000Z`;
+      report.summary.providerGenerationIds = [`gen-recalibration-${index + 1}`];
+      return report;
+    });
+    const cohort = fakeReleaseCohort(reports);
+    for (const field of ["binarySha256", "evaluatorSha256", "fixtureCorpusSha256", "screeningProfileSha256", "providerContractSha256"] as const) {
+      cohort.manifest[field] = original.summary[field];
+    }
+    const manifestBytes = JSON.stringify(cohort.manifest);
+    const manifestPath = resolve(directory, "cohort.json");
+    await writeFile(manifestPath, manifestBytes);
+    const baselinePath = resolve(directory, "baseline.json");
+    const historical = historicalArtifact("bench/baseline-us.json");
+    await writeFile(baselinePath, historical);
+    const arguments_: string[] = [];
+    for (const [index, report] of reports.entries()) {
+      const reportPath = resolve(directory, `report-${index}.json`);
+      const receiptPath = resolve(directory, `receipt-${index}.json`);
+      cohort.receipts[index]!.receipt.manifestSha256 = sha256(manifestBytes);
+      await writeFile(reportPath, JSON.stringify(report));
+      await writeFile(receiptPath, JSON.stringify(cohort.receipts[index]!.receipt));
+      arguments_.push("--expected-run-id", report.summary.runId, "--result", reportPath, "--receipt", receiptPath);
+    }
+    const run = async () => {
+      const execution = cohort.manifest.execution;
+      const child = Bun.spawn([
+        process.execPath, "--no-env-file", resolve(import.meta.dir, "compare-baseline.ts"),
+        "--binary", process.execPath, "--baseline", baselinePath, "--screen-profile", profilePath,
+        "--cohort-manifest", manifestPath, ...arguments_, "--record",
+      ], { stdout: "pipe", stderr: "pipe", timeout: 10_000, env: {
+        GITHUB_REPOSITORY: execution.repository, GITHUB_SHA: execution.sourceSha,
+        GITHUB_REF: execution.sourceRef, GITHUB_RUN_ID: execution.runId, GITHUB_RUN_ATTEMPT: execution.runAttempt,
+      } });
+      const [code, stdout, stderr] = await Promise.all([
+        child.exited, new Response(child.stdout).text(), new Response(child.stderr).text(),
+      ]);
+      return { code, output: stdout + stderr };
+    };
+    const receiptPath = resolve(directory, "receipt-9.json");
+    const receiptBytes = await readFile(receiptPath);
+    await writeFile(receiptPath, JSON.stringify({ ...cohort.receipts[9]!.receipt, state: "failed", exitCode: 1 }));
+    expect((await run()).code).not.toBe(0);
+    expect(await readFile(baselinePath, "utf8")).toBe(historical);
+    await writeFile(receiptPath, receiptBytes);
+    const recorded = await run();
+    expect(recorded.code).toBe(0);
+    expect(recorded.output).toContain("Recorded baseline");
+    const baseline = parseBaselineFile(JSON.parse(await readFile(baselinePath, "utf8")));
+    expect(baseline.corpus.evaluatorSha256).toBe(original.summary.evaluatorSha256);
+    expect(baseline.corpus.fixtureCorpusSha256).toBe(original.summary.fixtureCorpusSha256);
+    const profile = baseline.profiles[original.summary.model]!;
+    expect(profile.populated).toBe(true);
+    if (!isCalibratedBaselineProfile(profile)) throw new Error("recorded calibration is missing");
+    expect(profile.calibration.reportCount).toBe(10);
+    expect(profile.calibration.sourceSha).toBe(cohort.manifest.execution.sourceSha);
+    for (const [name, prior] of Object.entries(JSON.parse(historical).profiles)) {
+      if (name !== original.summary.model) expect(baseline.profiles[name]).toEqual(prior);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 describe("predeclared cohort evidence", () => {
   test("accepts every completed immutable slot", () => {

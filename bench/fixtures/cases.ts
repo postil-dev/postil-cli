@@ -92,11 +92,11 @@ export function makeDiff(path: string, hunks: FixtureHunk[]): string {
   ].join("\n");
 }
 
-function makeDistantStreamingChurn(side: "prefix" | "suffix"): string {
+function makeDistantStreamingChurn(side: "prefix" | "suffix", additionalChangeLine?: number): string {
   return Array.from({ length: 3 }, (_, fileIndex) => {
     const lines = [` export function ordinary_${side}_${fileIndex}(actor: Actor) {`];
     for (let line = 2; line < 130; line += 1) {
-      if (line === 64) {
+      if (line === 64 || line === additionalChangeLine) {
         lines.push(
           `-  const ordinary_${side}_${fileIndex}_${line}=actor.id;`,
           `+  const ordinary_${side}_${fileIndex}_${line} = actor.id;`,
@@ -1109,7 +1109,7 @@ const fixtureSpecs: FixtureSpec[] = [
       "export async function bulkEdit(actor: Actor, changeSet: ChangeSet) { await applyBulkEdit(changeSet); }",
     policy: "Huge diffs still need authorization checks on privileged writes.",
     scoringLabels: ["huge-low-signal", "multi-hunk", "security", "authorization", "error"],
-    prefixDiff: makeDistantStreamingChurn("prefix"),
+    prefixDiff: makeDistantStreamingChurn("prefix", 70),
     suffixDiff: makeDistantStreamingChurn("suffix"),
     expectedCoverage: "bounded",
     finding: {
