@@ -7,6 +7,9 @@ import { cases } from "../fixtures/cases";
 import type { Envelope } from "./harness";
 import {
   aggregateAttemptAccounting,
+  adjudicationSummarySchema,
+  decodeAdjudicationCapture,
+  isTransientFailure,
   boundedCoverageFailure,
   envelopeOperationalFailure,
   exactProviderCost,
@@ -480,12 +483,20 @@ describe("live benchmark operational envelopes", () => {
       };
       const second = envelope(20, 3, "0.00018", 90);
       const binary = join(root, "fake-postil");
+      const skipped = { version: 1, phase: "adjudication", outcome: "notRequired", callsStarted: 0,
+        correctionKind: null, phaseElapsedMs: null, initialBudgetMs: null, firstCallElapsedMs: null,
+        firstCallRemainingMs: null, promptTokens: null, completionTokens: null, costProviderDecimal: null,
+        usageAccountingComplete: null, incidents: [] };
       await writeFile(binary, `#!/bin/sh
+nonce=$(printf '%s' "$POSTIL_BENCH_ADJUDICATION_NONCE" | tr '0123456789abcdef' '!#$%&()*+,\\-./:;<')
 if [ -f '${marker}' ]; then
   printf 2 > '${marker}'
+  printf '\\036%s%s %s %s %s\\n' '${capturePayload("postil: adjudication-metrics ")}' "$nonce" '${capturePayload(JSON.stringify(skipped))}' "$nonce" '${capturePayload("end")}' >&2
   printf '%s\\n' '${JSON.stringify(second)}'
 else
   printf 1 > '${marker}'
+  printf '\\036%s%s %s' '${capturePayload("postil: adjudication-metrics ")}' "$nonce" '${capturePayload('{"phaseElapsedMs":503')}' >&2
+  printf 'postil: finding adjudication unavailable; preserving all generated findings\\n' >&2
   printf '%s\\n' '${JSON.stringify(first)}'
 fi
 `, { mode: 0o700 });
@@ -511,6 +522,10 @@ fi
         attemptCount: 2,
         recoveredErrors: ["operational envelope: review/invalidOutput"],
       });
+      expect(report.results[0]!.adjudicationAttempts).toMatchObject([
+        { outerAttempt: 1, attemptResult: "failed", captureStatus: "notObserved", phaseStart: "unknown", producerFrameObserved: true },
+        { outerAttempt: 2, attemptResult: "scored", captureStatus: "valid", summary: { outcome: "notRequired" } },
+      ]);
       expect(report.summary.totalTokens).toEqual({ prompt: 30, completion: 5, total: 35 });
       expect(report.summary.observedProviderCostUsdDecimal).toBe("0.0003");
       expect(report.summary.costAccountingComplete).toBe(true);
@@ -519,6 +534,25 @@ fi
         retriedCases: 1,
         recoveredErrors: [{ error: "operational envelope: review/invalidOutput", count: 1 }],
       });
+
+      for (const [index, diagnostic, retries] of [
+        [0, "time\x1e*!out", 0], [1, "5\x1e*!03", 0],
+        [2, "time\x1e*!out\n503", 1], [3, "5\x1e*!03\ntimeout", 1],
+      ] as const) {
+        const failed = { ...first, modelIncidents: [{ phase: "review", category: "providerError", recovered: false }] };
+        await writeFile(binary, `#!/bin/sh
+printf '%s' '${diagnostic}' >&2
+printf '%s\\n' '${JSON.stringify(failed)}'
+`, { mode: 0o700 });
+        const observed = await runLive([cases[0]!], { binary, model: "test/model", rootDir: root,
+          runId: `diagnostic-boundary-${index}`, concurrency: 1, retries: 1 });
+        expect(observed.results[0]).toMatchObject({ scored: false, attemptCount: 1 + retries,
+          durationMs: 110 * (1 + retries), promptTokens: 10 * (1 + retries), completionTokens: 2 * (1 + retries),
+          observedProviderCostUsdDecimal: retries ? "0.00024" : "0.00012", costAccountingComplete: true });
+        expect(observed.results[0]!.adjudicationAttempts).toHaveLength(1 + retries);
+        expect(observed.results[0]!.adjudicationAttempts!.every((attempt) =>
+          attempt.phaseStart === "unknown" && attempt.captureStatus === "notObserved")).toBe(true);
+      }
     } finally {
       if (previousKey === undefined) delete process.env.MODEL_API_KEY;
       else process.env.MODEL_API_KEY = previousKey;
@@ -612,5 +646,179 @@ fi
         reason: "below threshold",
       }],
     }, "qualified/scorer")).toContain("identity missing");
+  });
+});
+
+
+const captureAlphabet = "!#$%&()*+,-./:;<";
+const captureChallenge = (nonce: string) => [...nonce].map((nibble) => captureAlphabet[parseInt(nibble, 16)]).join("");
+const capturePayload = (text: string) => [...Buffer.from(text)].map((byte) => captureAlphabet[byte >> 4]! + captureAlphabet[byte & 15]!).join("");
+const captureFrame = (record: unknown, nonce: string) =>
+  `\x1e${capturePayload("postil: adjudication-metrics ")}${captureChallenge(nonce)} ${capturePayload(JSON.stringify(record))} ${captureChallenge(nonce)} ${capturePayload("end")}\n`;
+
+describe("adjudication terminal capture", () => {
+  test("only a positively refused child spawn establishes notStarted", async () => {
+    const root = await mkdtemp(join(tmpdir(), "postil-capture-no-start-"));
+    const previous = process.env.MODEL_API_KEY;
+    process.env.MODEL_API_KEY = crypto.randomUUID();
+    try {
+      const binary = join(root, "nonexecutable-child");
+      await writeFile(binary, "child cannot execute\n", { mode: 0o600 });
+      const report = await runLive([cases[0]!], { binary, model: "test/model", rootDir: root,
+        runId: "spawn-refused", concurrency: 1, retries: 0 });
+      expect(report.results[0]!.adjudicationAttempts).toEqual([{
+        outerAttempt: 1, attemptResult: "failed", failureClass: "spawnFailure",
+        phaseStart: "notStarted", captureStatus: "notObserved",
+      }]);
+      expect(report.results[0]!.attemptCount).toBe(1);
+      expect(report.results[0]!.costAccountingComplete).toBe(false);
+    } finally {
+      if (previous === undefined) delete process.env.MODEL_API_KEY; else process.env.MODEL_API_KEY = previous;
+      await rm(root, { recursive: true });
+    }
+  });
+
+  const nonce = crypto.randomUUID().replaceAll("-", "");
+  const summary = (overrides = {}) => ({ version: 1, phase: "adjudication", outcome: "validated",
+    callsStarted: 1, correctionKind: null, phaseElapsedMs: 503, initialBudgetMs: 60000,
+    firstCallElapsedMs: 500, firstCallRemainingMs: 59500, promptTokens: 10, completionTokens: 2,
+    costProviderDecimal: "0.000003", usageAccountingComplete: true, incidents: [], ...overrides });
+  const frame = (record: unknown, challenge = nonce) => captureFrame(record, challenge);
+
+  test("accepts exactly reachable outcome/call/correction tuples", () => {
+    for (const outcome of ["validated", "failed", "notRequired"]) {
+      for (const callsStarted of [0, 1, 2]) for (const correctionKind of [null, "schemaRepair", "semanticRetry"]) {
+        const skipped = outcome === "notRequired";
+        const record = summary({ outcome, callsStarted, correctionKind, ...(skipped ? {
+          phaseElapsedMs: null, initialBudgetMs: null, firstCallElapsedMs: null, firstCallRemainingMs: null,
+          promptTokens: null, completionTokens: null, costProviderDecimal: null, usageAccountingComplete: null,
+        } : {}) });
+        const reachable = skipped ? callsStarted === 0 && correctionKind === null
+          : callsStarted === 1 ? outcome === "failed" || correctionKind === null
+          : callsStarted === 2 && correctionKind !== null;
+        expect(adjudicationSummarySchema.safeParse(record).success).toBe(reachable);
+      }
+    }
+    for (const invalid of [summary({ phaseElapsedMs: -1 }), summary({ promptTokens: 2 ** 53 }),
+      summary({ firstCallRemainingMs: 60001 }), summary({ extra: 1 }), summary({ costProviderDecimal: "0.00" })]) {
+      expect(decodeAdjudicationCapture(frame(invalid), nonce).evidence.captureStatus).toBe("invalid");
+    }
+  });
+
+  test("isolates matching transport from retry decisions and preserves caller diagnostics", async () => {
+    for (let elapsed = 0; elapsed <= 1200; elapsed++) {
+      for (const ordinary of ["", "postil: failure\n", "postil: provider returned 503\n", "timeout\n"]) {
+        const baseline = { scored: false, error: "other", stderr: ordinary } as Parameters<typeof isTransientFailure>[0];
+        const captured = decodeAdjudicationCapture(ordinary + frame(summary({ phaseElapsedMs: elapsed, firstCallElapsedMs: 0, firstCallRemainingMs: 60000 })), nonce);
+        expect(captured.evidence.captureStatus).toBe("valid");
+        expect(isTransientFailure({ ...baseline, stderr: captured.classifierStderr })).toBe(isTransientFailure(baseline));
+      }
+    }
+    const full = frame(summary({ outcome: "failed" }));
+    const headerLength = `\x1e${capturePayload("postil: adjudication-metrics ")}${captureChallenge(nonce)} `.length;
+    const closingLength = full.trimEnd().length;
+    const payloadEnd = full.indexOf(" ", headerLength);
+    const callers = ["", "503", "429", "timeout", "econnreset", "network", "ordinary suffix", "Error: time\x1eout",
+      "postil: finding adjudication unavailable; preserving all generated findings\n",
+      "postil: finding adjudication unavailable; preserving 1 finding (HTTP 503)\n",
+      "postil: failed to build adjudication prompt; preserving all generated findings\n",
+      "Error: provider returned 503\n", "postil: provider returned 503\n"];
+    const callerSource = await readFile(join(import.meta.dir, "../../src/review.rs"), "utf8");
+    const adjudicationCaller = callerSource.slice(callerSource.indexOf("let adjudicated = match adjudication_user"), callerSource.indexOf("staged_adjudication = Some"));
+    const actualDiagnostics = [...adjudicationCaller.matchAll(/eprintln!\(\s*"((?:[^"\\]|\\.)*)"/gu)]
+      .map((match) => match[1]!.replace(/\{[^}]*\}/gu, "503") + "\n");
+    expect(actualDiagnostics).toHaveLength(3);
+    for (let cut = 0; cut <= full.length; cut++) for (const caller of [...callers, ...actualDiagnostics]) {
+      const decoded = decodeAdjudicationCapture(full.slice(0, cut) + caller, nonce);
+      const baseline = { scored: false, error: "other", stderr: caller } as Parameters<typeof isTransientFailure>[0];
+      expect(isTransientFailure({ ...baseline, stderr: decoded.classifierStderr })).toBe(isTransientFailure(baseline));
+      const retained = cut < headerLength ? full.slice(0, cut) : cut === full.length ? "\n\n"
+        : "\n" + (cut < closingLength && cut > payloadEnd ? full.slice(payloadEnd, cut) : "");
+      expect(decoded.classifierStderr).toBe(retained + caller);
+      expect(decoded.evidence.captureStatus).toBe(cut >= closingLength ? "valid" : "notObserved");
+      if (cut >= headerLength && cut < closingLength) expect(decoded.evidence).toMatchObject({ producerFrameObserved: true });
+      if (cut < closingLength) expect(decoded.evidence.summary).toBeUndefined();
+    }
+    // A raw status appended exactly after the encoded partial elapsed field
+    // remains the caller's signature, never part of the uncompleted record.
+    const elapsedPrefix = `\x1e${capturePayload("postil: adjudication-metrics ")}${captureChallenge(nonce)} ${capturePayload('{"phaseElapsedMs":')}`;
+    expect(decodeAdjudicationCapture(elapsedPrefix + "503", nonce).classifierStderr).toBe("\n503");
+  });
+
+  test("preserves unrecognized bytes and prevents retry signatures across removed transport", () => {
+    const retry = (stderr: string) => isTransientFailure({ scored: false, error: "other", stderr } as Parameters<typeof isTransientFailure>[0]);
+    for (const input of ["time\x1e*!out", "5\x1e*!03"]) {
+      const decoded = decodeAdjudicationCapture(input, nonce);
+      expect(retry(input)).toBe(false);
+      expect(decoded.classifierStderr).toBe(input);
+      expect(retry(decoded.classifierStderr)).toBe(false);
+      expect(decoded.evidence).toEqual({ phaseStart: "unknown", captureStatus: "notObserved" });
+    }
+    const full = frame(summary());
+    const header = `\x1e${capturePayload("postil: adjudication-metrics ")}${captureChallenge(nonce)} `;
+    const trailer = ` ${captureChallenge(nonce)} ${capturePayload("end")}`;
+    const payloadEnd = full.indexOf(" ", header.length);
+    const closingLength = full.trimEnd().length;
+    const wrong = frame(summary(), crypto.randomUUID().replaceAll("-", ""));
+    const signatures = ["503", "429", "rate limit", "timeout", "time out", "network", "econnreset",
+      "too many requests", "temporarily unavailable", "service unavailable", "bad gateway", "gateway time-out",
+      "overloaded", "connection reset", "econnrefused", "etimedout", "socket hang up"];
+    for (const signature of signatures) {
+      for (let split = 1; split < signature.length; split++) {
+        const left = signature.slice(0, split), right = signature.slice(split);
+        for (const fragment of ["\x1e", "\x1e*!", "\x1e?", header.slice(0, -8), wrong]) {
+          const input = left + fragment + right;
+          const decoded = decodeAdjudicationCapture(input, nonce);
+          expect(decoded.classifierStderr).toBe(input);
+          expect(retry(decoded.classifierStderr)).toBe(retry(input));
+          expect(decoded.evidence.captureStatus).toBe("notObserved");
+        }
+      }
+      // Every producer cut is surrounded by ordinary bytes. Genuine complete
+      // signatures on either side survive, while split keywords stay split.
+      const split = Math.floor(signature.length / 2);
+      for (let cut = 0; cut <= full.length; cut++) {
+        const fragment = full.slice(0, cut);
+        for (const [left, right] of [[signature.slice(0, split), signature.slice(split)],
+          [`${signature}\n`, "ordinary"], ["ordinary", `\n${signature}`]]) {
+          const input = left + fragment + right;
+          const decoded = decodeAdjudicationCapture(input, nonce);
+          expect(retry(decoded.classifierStderr)).toBe(retry(input));
+          if (cut === header.length - 1 && right.startsWith(" ")) {
+            // The suffix supplies the final separator of a complete matching
+            // header; the remaining ordinary suffix still survives.
+            expect(decoded.classifierStderr).toBe(left + "\n" + right.slice(1));
+          } else if (cut < header.length) expect(decoded.classifierStderr).toBe(input);
+          else {
+            const retained = cut === full.length ? "\n\n" : "\n" +
+              (cut < closingLength && cut > payloadEnd ? full.slice(payloadEnd, cut) : "");
+            expect(decoded.classifierStderr).toBe(left + retained + right);
+          }
+        }
+      }
+      const malformed = header + signature + trailer;
+      expect(decodeAdjudicationCapture(malformed, nonce)).toEqual({
+        evidence: { phaseStart: "unknown", captureStatus: "invalid" }, classifierStderr: malformed,
+      });
+      expect(retry(decodeAdjudicationCapture(malformed, nonce).classifierStderr)).toBe(true);
+    }
+    for (const malformed of [header + "!" + trailer, header + capturePayload("not json") + trailer]) {
+      const decoded = decodeAdjudicationCapture("time" + malformed + "out", nonce);
+      expect(decoded.evidence.captureStatus).toBe("invalid");
+      expect(decoded.classifierStderr).toBe("time\nout");
+      expect(retry(decoded.classifierStderr)).toBe(false);
+    }
+  });
+
+  test("ignores stale nonces and rejects authenticated malformed and duplicate frames", () => {
+    const wrong = crypto.randomUUID().replaceAll("-", "");
+    expect(decodeAdjudicationCapture(frame(summary(), wrong), nonce).evidence.captureStatus).toBe("notObserved");
+    const result = decodeAdjudicationCapture(frame(summary(), wrong) + frame(summary()), nonce);
+    expect(result.evidence.captureStatus).toBe("valid");
+    expect(JSON.stringify(result.evidence)).not.toContain(nonce);
+    expect(decodeAdjudicationCapture(frame(summary()) + frame(summary()), nonce).evidence.captureStatus).toBe("duplicate");
+    expect(decodeAdjudicationCapture(`\x1e${capturePayload("postil: adjudication-metrics ")}${captureChallenge(nonce)} {?} ${captureChallenge(nonce)} ${capturePayload("end")}\n`, nonce).evidence.captureStatus).toBe("invalid");
+    expect(decodeAdjudicationCapture(frame(summary()).trimEnd(), nonce).evidence.captureStatus).toBe("valid");
+    expect(decodeAdjudicationCapture(frame({ extra: "x".repeat(2048) }), nonce).evidence.captureStatus).toBe("invalid");
   });
 });

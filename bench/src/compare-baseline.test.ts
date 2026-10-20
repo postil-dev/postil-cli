@@ -7,6 +7,8 @@ import { resolve } from "node:path";
 import { cases } from "../fixtures/cases";
 import {
   aggregateObservedMetrics,
+  assertAdjudicationCapture,
+  formatAdjudicationCapture,
   assertCompleteCohortEvidence,
   assertDistinctRunIdentities,
   assertDistinctRawReportDigests,
@@ -225,6 +227,15 @@ interface FakeReportOptions {
   runId?: string;
 }
 
+function capturedAdjudicationAttempt() {
+  return { outerAttempt: 1, attemptResult: "scored" as const, phaseStart: "unknown" as const,
+    captureStatus: "valid" as const, authenticity: "perAttemptNonceMatched" as const,
+    summary: { version: 1 as const, phase: "adjudication" as const, outcome: "validated" as const,
+      callsStarted: 1 as const, correctionKind: null, phaseElapsedMs: 503, initialBudgetMs: 60000,
+      firstCallElapsedMs: 500, firstCallRemainingMs: 59500, promptTokens: 10, completionTokens: 2,
+      costProviderDecimal: "0.000003", usageAccountingComplete: true, incidents: [] } };
+}
+
 let fakeRunSequence = 0;
 
 function fakeReport(options: FakeReportOptions = {}): LiveReportForComparison {
@@ -248,6 +259,8 @@ function fakeReport(options: FakeReportOptions = {}): LiveReportForComparison {
       observedProviderCostUsdDecimal: costPerCase,
       costAccountingComplete: true,
       attemptCount: 1,
+      adjudicationEvidenceVersion: 1,
+      adjudicationAttempts: [capturedAdjudicationAttempt()],
       recoveredErrors: [],
       exitCode: truthSeverity === "error" && caseDetected === true ? 1 : 0,
     };
@@ -351,6 +364,8 @@ async function inputBoundReport(screeningProfilePath = resolve(import.meta.dir, 
       observedProviderCostUsdDecimal: "0.001",
       costAccountingComplete: true,
       attemptCount: 1,
+      adjudicationEvidenceVersion: 1,
+      adjudicationAttempts: [capturedAdjudicationAttempt()],
       recoveredErrors: [],
       exitCode: caseDetected && finding?.severity === "error" ? 1 : 0,
     };
@@ -697,6 +712,17 @@ test("recording replaces a populated historical baseline only after complete cur
     expect((await run()).code).not.toBe(0);
     expect(await readFile(baselinePath, "utf8")).toBe(historical);
     await writeFile(receiptPath, receiptBytes);
+    const reportPath = resolve(directory, "report-0.json");
+    const reportBytes = await readFile(reportPath);
+    const malformedCapture = JSON.parse(reportBytes.toString());
+    malformedCapture.results[0].adjudicationAttempts[0].summary.phaseElapsedMs = -1;
+    await writeFile(reportPath, JSON.stringify(malformedCapture));
+    const invalidCapture = await run();
+    expect(invalidCapture.code).not.toBe(0);
+    expect(invalidCapture.output).toContain("original attempt 1: invalid capture field summary.phaseElapsedMs");
+    expect(invalidCapture.output).toContain("No replacement call is permitted");
+    expect(await readFile(baselinePath, "utf8")).toBe(historical);
+    await writeFile(reportPath, reportBytes);
     const recorded = await run();
     expect(recorded.code).toBe(0);
     expect(recorded.output).toContain("Recorded baseline");
@@ -1425,5 +1451,63 @@ describe("CLI report selection", () => {
       resultPaths: ["one.json"],
       receiptPaths: [],
     })).toContain("predeclared ten-report calibration cohort");
+  });
+});
+
+
+describe("formal adjudication capture acceptance", () => {
+  test("retains failed unknowns and requires complete final capture without changing verdict", () => {
+    const report = fakeReport();
+    const result = report.results[0]!;
+    const final = capturedAdjudicationAttempt();
+    final.outerAttempt = 2;
+    result.attemptCount = 2;
+    result.recoveredErrors = ["operational envelope: review/invalidOutput"];
+    result.adjudicationAttempts = [{ outerAttempt: 1, attemptResult: "failed", failureClass: "processTimeout",
+      phaseStart: "unknown", captureStatus: "notObserved", producerFrameObserved: true,
+      captureDetail: "unterminatedAuthenticatedFrame" }, final];
+    expect(() => assertAdjudicationCapture(report, 1)).not.toThrow();
+    expect(formatAdjudicationCapture([report])).toContain("1 attempts with unknown measurements");
+    expect(formatAdjudicationCapture([report])).toContain("Correction recovery (captured subset): unmeasured");
+    const preserved = structuredClone(result);
+    for (const status of ["notObserved", "invalid", "duplicate"] as const) {
+      result.adjudicationAttempts[1] = { outerAttempt: 2, attemptResult: "scored", phaseStart: "unknown", captureStatus: status };
+      expect(() => assertAdjudicationCapture(report, 1)).toThrow(/case defect-01, original attempt 2/);
+      expect(result.scored).toBe(true);
+    }
+    Object.assign(result, preserved);
+    for (const status of ["invalid", "duplicate"] as const) {
+      result.adjudicationAttempts![0] = { outerAttempt: 1, attemptResult: "failed", failureClass: "operational", phaseStart: "unknown", captureStatus: status };
+      expect(() => assertAdjudicationCapture(report, 1)).toThrow("authenticated capture");
+    }
+  });
+
+  test("calibration and release share the capture refusal before recording or publication", () => {
+    for (const count of [5, 10]) {
+      const reports = Array.from({ length: count }, () => fakeReport());
+      const check = () => { const cohort = fakeReleaseCohort(reports); return assertCompleteCohortEvidence({
+        ...cohort, manifestSha256: "9".repeat(64), reports, record: count === 10,
+      }); };
+      expect(check).not.toThrow();
+      delete reports[0]!.results[0]!.adjudicationAttempts;
+      expect(check).toThrow("No replacement call is permitted");
+      expect(check).toThrow("Preserve original samples and any spent release tag");
+    }
+  });
+
+  test("zero candidates and correction populations retain explicit denominators", () => {
+    const report = fakeReport();
+    const first = report.results[0]!.adjudicationAttempts![0]!;
+    first.summary = { version: 1, phase: "adjudication", outcome: "notRequired", callsStarted: 0,
+      correctionKind: null, phaseElapsedMs: null, initialBudgetMs: null, firstCallElapsedMs: null,
+      firstCallRemainingMs: null, promptTokens: null, completionTokens: null, costProviderDecimal: null,
+      usageAccountingComplete: null, incidents: [] };
+    expect(() => assertAdjudicationCapture(report, 1)).not.toThrow();
+    const correction = report.results[1]!.adjudicationAttempts![0]!.summary!;
+    correction.callsStarted = 2; correction.correctionKind = "semanticRetry";
+    expect(formatAdjudicationCapture([report])).toContain("1 zero-candidate runs");
+    expect(formatAdjudicationCapture([report])).toContain("Correction recovery (captured subset): 1/1");
+    first.summary.outcome = "failed";
+    expect(() => assertAdjudicationCapture(report, 1)).toThrow();
   });
 });

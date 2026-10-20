@@ -215,14 +215,58 @@ fi
     expect(refused.calls.some(args => args.includes("POST"))).toBe(false);
   }
   await writeFile(baselinePath, baselineBytes);
-  await writeFile(resolve(directory, "bench/baseline-us.attestation.json"), "");
+  const retainedBundlePath = resolve(directory, "bench/baseline-us.attestation.json");
+  const retainedBundleBytes = await readFile(retainedBundlePath);
+  await writeFile(retainedBundlePath, "");
   const missingBundle = await run();
   expect(missingBundle.output).toContain("requires the retained baseline attestation");
   expect(missingBundle.calls.some(args => args.includes("POST"))).toBe(false);
+  await writeFile(baselinePath, baselineBytes);
+  await writeFile(retainedBundlePath, retainedBundleBytes);
+  const restored = await run();
+  expect(restored.code).toBe(0);
+  expect(restored.calls.find(args => args[0] === "attestation")).toEqual(verification);
+  expect(await readFile(baselinePath)).toEqual(baselineBytes);
+  expect(await readFile(retainedBundlePath)).toEqual(retainedBundleBytes);
+  // The exact retained current pair also supports a later changed evaluator.
+  const currentPair = await readFile(resolve(root, "bench/baseline-us.json"));
+  const currentBundle = await readFile(resolve(root, "bench/baseline-us.attestation.json"));
+  const currentSource = JSON.parse(currentPair.toString()).profiles["openai/gpt-5.6-luna"].calibration.sourceSha;
+  await writeFile(baselinePath, currentPair);
+  await writeFile(retainedBundlePath, currentBundle);
+  const restoredCurrent = await run({ REGISTRY_SHA: currentSource });
+  expect(restoredCurrent.code).toBe(0);
+  const currentVerification = restoredCurrent.calls.find(args => args[0] === "attestation")!;
+  expect(currentVerification[currentVerification.indexOf("--source-digest") + 1]).toBe(currentSource);
+  expect(await readFile(baselinePath)).toEqual(currentPair);
+  expect(await readFile(retainedBundlePath)).toEqual(currentBundle);
   await writeFile(baselinePath, JSON.stringify({ profiles: { "openai/gpt-5.6-luna": { populated: false } } }));
   const bootstrap = await run();
   expect(bootstrap.code).toBe(0);
   expect(bootstrap.calls.some(args => args[0] === "attestation")).toBe(false);
+});
+
+test("source rollback restores the exact historical pair and refuses partial or cross-paired restoration", async () => {
+  const context = await transport();
+  const sourcePath = resolve(context.root, "bench/src/live.ts");
+  const baselinePath = resolve(context.root, "bench/baseline-us.json");
+  const bundlePath = resolve(context.root, "bench/baseline-us.attestation.json");
+  const [source, baseline, bundle] = await Promise.all([readFile(sourcePath), readFile(baselinePath), readFile(bundlePath)]);
+  const original = await verifyLegacyCalibration(context);
+  await cp(resolve(root, "bench/src/live.ts"), sourcePath);
+  await expect(verifyLegacyCalibration(context)).rejects.toThrow("evaluator is stale");
+  // An incomplete source/pair rollback and a substituted pair remain refused.
+  await writeFile(baselinePath, JSON.stringify({ ...JSON.parse(baseline.toString()), schemaVersion: 3 }));
+  await writeFile(sourcePath, source);
+  await expect(verifyLegacyCalibration(context)).rejects.toThrow("Unsupported legacy calibration artifact pair");
+  await writeFile(baselinePath, baseline);
+  await writeFile(bundlePath, JSON.stringify({ dsseEnvelope: { payload: "cross-paired" } }));
+  await expect(verifyLegacyCalibration(context)).rejects.toThrow("Unsupported legacy calibration artifact pair");
+  await writeFile(bundlePath, bundle);
+  expect(await verifyLegacyCalibration(context)).toEqual(original);
+  expect(await readFile(baselinePath)).toEqual(baseline);
+  expect(await readFile(bundlePath)).toEqual(bundle);
+  expect(context.calls.at(-1)).toContain("--source-digest");
 });
 
 test("actual evaluator, effective-launch and workflow mutations invalidate legacy freshness", async () => {

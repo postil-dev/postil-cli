@@ -1,4 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import { runLive, decodeAdjudicationCapture, type LiveReport } from "./live";
+import { cohortSlotPaths, createCohortManifest, readCohortReceipt, reportSemanticSha256, sha256 } from "./cohort";
+import { reserveCohortSlot, executeReservedCohortSlot } from "./cohort-run";
+import { assertAdjudicationCapture, type LiveReportForComparison } from "./compare-baseline";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { execFile as execFileCallback } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -2687,3 +2691,136 @@ test("diagnostic custody rejects dirty, stale and mismatched inputs before gener
     await rm(dirty, { recursive: true, force: true });
   }
 }, 120_000);
+
+
+test("real diff-file child retains authentic adjudication measurements through live reporting", async () => {
+  const root = await mkdtemp(join(tmpdir(), "postil-capture-child-"));
+  const c = fixture("clean-comment-only");
+  let mode = "firstValid", calls = 0;
+  const requests: string[] = [];
+  const server = createServer(async (req, res) => {
+    const body = await requestBody(req);
+    requests.push(body);
+    const adjudication = adjudicationResponse(body);
+    const finding = falseFinding(c);
+    const findings = mode === "zeroCandidates" ? [] : mode === "promptFailure"
+      ? Array.from({ length: 20 }, (_, index) => ({ ...finding, title: `${finding.title} ${String.fromCharCode(97 + index)}`,
+        body: `${finding.body} ${String.fromCharCode(97 + index)} ${"界".repeat(1000)}.` })) : [finding];
+    let content = JSON.stringify({ summary: mode === "zeroCandidates" ? "" : "Local capture fixture", findings });
+    if (adjudication !== null) {
+      calls++;
+      content = adjudication;
+      if ((mode === "schemaRepair" && calls === 1) || mode === "terminalFailure") content = "not an array";
+      if (mode === "semanticRetry" && calls === 1) content = JSON.stringify([{ ...JSON.parse(adjudication)[0], candidateId: "unknown-candidate" }]);
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ choices: [{ finish_reason: "stop", message: { content } }],
+      usage: { prompt_tokens: 30, completion_tokens: 10, cost: 0.000045 } }));
+  });
+  const apiBase = await listen(server);
+  const previousKey = process.env.MODEL_API_KEY;
+  const previousBase = process.env.POSTIL_API_BASE;
+  const previousNonce = process.env.POSTIL_BENCH_ADJUDICATION_NONCE;
+  process.env.MODEL_API_KEY = crypto.randomUUID();
+  process.env.POSTIL_API_BASE = apiBase;
+  const inheritedNonce = crypto.randomUUID().replaceAll("-", "");
+  process.env.POSTIL_BENCH_ADJUDICATION_NONCE = inheritedNonce;
+  const binary = join(root, "local-child");
+  await writeFile(binary, `#!/bin/sh\nexport POSTIL_ALLOW_PRIVATE_API_BASE=1\nexec '${postilBinaryPath()}' "$@"\n`, { mode: 0o700 });
+  try {
+    const execution = { kind: "github-sigstore-v1", repository: "postil-dev/postil-cli",
+      signerWorkflow: ".github/workflows/release.yml", sourceSha: "b".repeat(40),
+      sourceRef: "refs/tags/v1.0.0", runId: "123", runAttempt: "1" } as const;
+    const screeningProfilePath = resolve(import.meta.dir, "../../provisional-models.json");
+    const manifest = await createCohortManifest({ purpose: "release", binaryPath: binary, screeningProfilePath,
+      runPrefix: "local-capture", execution });
+    const manifestPath = join(root, "manifest.json");
+    await writeFile(manifestPath, JSON.stringify(manifest));
+    const slotOptions = { manifestPath, slot: 1, binaryPath: binary, screeningProfilePath,
+      environment: { GITHUB_REPOSITORY: execution.repository, GITHUB_SHA: execution.sourceSha,
+        GITHUB_REF: execution.sourceRef, GITHUB_RUN_ID: execution.runId, GITHUB_RUN_ATTEMPT: execution.runAttempt } };
+    for (mode of ["firstValid", "schemaRepair", "semanticRetry", "terminalFailure", "zeroCandidates", "promptFailure"]) {
+      calls = 0; requests.length = 0;
+      const runId = mode === "firstValid" ? manifest.slots[0]!.runId : mode;
+      let report: LiveReport;
+      if (mode === "firstValid") {
+        await reserveCohortSlot(slotOptions);
+        expect(await executeReservedCohortSlot({ ...slotOptions, executeBenchmark: async ({ reportPath, runId }) => {
+          report = await runLive([c], { binary, model: "test/model", rootDir: root, runId, concurrency: 1, retries: 0 });
+          await writeFile(reportPath, JSON.stringify(report));
+          return report.results[0]!.scored ? 0 : 1;
+        } })).toBe(0);
+        const paths = cohortSlotPaths(manifestPath, 1);
+        const { receipt } = await readCohortReceipt(paths.receiptPath);
+        const raw = await readFile(paths.reportPath);
+        expect(receipt.state).toBe("completed");
+        expect(receipt.state === "completed" && receipt.reportRawSha256).toBe(sha256(raw));
+        report = JSON.parse(raw.toString());
+        const mutated = structuredClone(report);
+        delete mutated.results[0]!.adjudicationAttempts;
+        expect(() => assertAdjudicationCapture(mutated as unknown as LiveReportForComparison, 1)).toThrow("missing capture capability");
+        expect(reportSemanticSha256(mutated)).not.toBe(reportSemanticSha256(report));
+        expect(sha256(JSON.stringify(mutated))).not.toBe(receipt.state === "completed" && receipt.reportRawSha256);
+        const originalCalls = requests.length;
+        await expect(executeReservedCohortSlot(slotOptions)).rejects.toThrow("already completed");
+        expect(requests).toHaveLength(originalCalls);
+      } else {
+        report = await runLive([c], { binary, model: "test/model", rootDir: root,
+          runId, concurrency: 1, retries: 0 });
+      }
+      const result = report.results[0]!;
+      const attempt = result.adjudicationAttempts![0]!;
+      const caseDirectory = (await readdir(join(root, "live", runId), { withFileTypes: true })).find((entry) => entry.isDirectory())!.name;
+      const artifacts = join(root, "live", runId, caseDirectory, "attempt-1");
+      const stderr = await readFile(join(artifacts, "stderr.log"), "utf8");
+      if (mode === "promptFailure") {
+        expect(calls).toBe(0);
+        expect(result.scored).toBe(false);
+        expect(attempt).toMatchObject({ captureStatus: "notObserved", phaseStart: "unknown", attemptResult: "failed" });
+        expect(attempt.summary).toBeUndefined();
+        expect(stderr).toContain("finding adjudication input exceeded its admitted bound");
+        continue;
+      }
+      const alphabet = "!#$%&()*+,-./:;<";
+      const prefix = "\x1e" + [...Buffer.from("postil: adjudication-metrics ")].map((byte) => alphabet[byte >> 4]! + alphabet[byte & 15]!).join("");
+      const encodedNonce = stderr.split(prefix)[1]?.slice(0, 32);
+      const nonce = encodedNonce && [...encodedNonce].map((char) => alphabet.indexOf(char).toString(16)).join("");
+      expect(nonce).toBeDefined();
+      expect(nonce).not.toBe(inheritedNonce);
+      expect(stderr.split(prefix)).toHaveLength(2);
+      expect(attempt.captureStatus).toBe("valid");
+      const decoded = decodeAdjudicationCapture(stderr, nonce!);
+      expect(decoded.evidence.summary).toEqual(attempt.summary);
+      expect(decoded.classifierStderr).not.toContain(encodedNonce!);
+      expect(stderr).not.toContain(nonce!);
+      expect(JSON.stringify(report)).not.toContain(nonce!);
+      expect(requests.every((body) => !body.includes(nonce!) && !body.includes(inheritedNonce))).toBe(true);
+      expect(attempt.summary?.outcome).toBe(mode === "zeroCandidates" ? "notRequired" : mode === "terminalFailure" ? "failed" : "validated");
+      expect(calls).toBe(mode === "zeroCandidates" ? 0 : mode === "firstValid" ? 1 : 2);
+      expect(attempt.summary?.callsStarted).toBe(calls);
+      expect(attempt.summary?.correctionKind).toBe(mode === "semanticRetry" ? "semanticRetry" :
+        mode === "schemaRepair" || mode === "terminalFailure" ? "schemaRepair" : null);
+      expect(result.scored, `${mode}: ${result.error ?? "no operational failure"}`).toBe(mode !== "terminalFailure");
+      if (mode !== "terminalFailure") expect(() => assertAdjudicationCapture(report as unknown as LiveReportForComparison, 1)).not.toThrow();
+      if (mode === "schemaRepair" || mode === "semanticRetry") expect(attempt.summary?.incidents).toEqual([
+        { phase: "scorer", category: "invalidOutput", recovered: true, recovery: "repair" },
+      ]);
+      if (mode !== "zeroCandidates") expect(attempt.summary?.promptTokens).toBe(30 * calls);
+    }
+    // The same binary's ordinary invocation carries no added frame.
+    const noCapture = join(root, "ordinary-child");
+    await writeFile(noCapture, `#!/bin/sh\nunset POSTIL_BENCH_ADJUDICATION_NONCE\nexport POSTIL_ALLOW_PRIVATE_API_BASE=1\nexec '${postilBinaryPath()}' "$@"\n`, { mode: 0o700 });
+    mode = "zeroCandidates";
+    const report = await runLive([c], { binary: noCapture, model: "test/model", rootDir: root,
+      runId: "capture-disabled", concurrency: 1, retries: 0 });
+    expect(report.results[0]!.scored).toBe(true);
+    expect(report.results[0]!.adjudicationAttempts![0]!.captureStatus).toBe("notObserved");
+    expect(() => assertAdjudicationCapture(report as unknown as LiveReportForComparison, 1)).toThrow("missing complete successful final capture");
+  } finally {
+    if (previousKey === undefined) delete process.env.MODEL_API_KEY; else process.env.MODEL_API_KEY = previousKey;
+    if (previousBase === undefined) delete process.env.POSTIL_API_BASE; else process.env.POSTIL_API_BASE = previousBase;
+    if (previousNonce === undefined) delete process.env.POSTIL_BENCH_ADJUDICATION_NONCE; else process.env.POSTIL_BENCH_ADJUDICATION_NONCE = previousNonce;
+    await close(server);
+    await rm(root, { recursive: true, force: true });
+  }
+}, 45_000);

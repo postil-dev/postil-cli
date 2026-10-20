@@ -25,8 +25,9 @@
 // tier (info<->warn and warn<->error treated as a match). See the severity-tier
 // helpers below for the rationale.
 
+import { z } from "zod";
 import { execFile as execFileCb } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
@@ -129,7 +130,121 @@ interface GroundTruth {
   severity: string | null;
 }
 
+const CAPTURE_ALPHABET = "!#$%&()*+,-./:;<";
+const encodeCaptureText = (text: string) => [...Buffer.from(text)]
+  .map((byte) => CAPTURE_ALPHABET[byte >> 4]! + CAPTURE_ALPHABET[byte & 15]!).join("");
+const ADJUDICATION_PREFIX = "\x1e" + encodeCaptureText("postil: adjudication-metrics ");
+const CAPTURE_MAX_BYTES = 2048;
+const safeCounter = z.number().int().safe().nonnegative();
+export const adjudicationSummarySchema = z.object({
+  version: z.literal(1), phase: z.literal("adjudication"),
+  outcome: z.enum(["validated", "failed", "notRequired"]),
+  callsStarted: z.union([z.literal(0), z.literal(1), z.literal(2)]),
+  correctionKind: z.enum(["schemaRepair", "semanticRetry"]).nullable(),
+  phaseElapsedMs: safeCounter.nullable(), initialBudgetMs: safeCounter.nullable(),
+  firstCallElapsedMs: safeCounter.nullable(), firstCallRemainingMs: safeCounter.nullable(),
+  promptTokens: safeCounter.nullable(), completionTokens: safeCounter.nullable(),
+  costProviderDecimal: z.string().max(128).refine((value) => {
+    try { return formatCanonicalDecimal(parseCanonicalDecimal(value)) === value; } catch { return false; }
+  }).nullable(),
+  usageAccountingComplete: z.boolean().nullable(),
+  incidents: z.array(z.object({
+    phase: z.literal("scorer"), category: z.enum(["providerError", "invalidOutput", "timeout", "deadline"]),
+    recovered: z.boolean(), recovery: z.enum(["repair", "fallback"]).optional(),
+  }).strict()).max(2),
+}).strict().superRefine((value, ctx) => {
+  const times = [value.phaseElapsedMs, value.initialBudgetMs, value.firstCallElapsedMs, value.firstCallRemainingMs];
+  const counters = [value.promptTokens, value.completionTokens];
+  const skipped = value.outcome === "notRequired";
+  const shape = skipped
+    ? value.callsStarted === 0 && value.correctionKind === null && [...times, ...counters].every((v) => v === null) &&
+      value.costProviderDecimal === null && value.usageAccountingComplete === null && value.incidents.length === 0
+    : value.callsStarted > 0 && [...times, ...counters].every((v) => v !== null) && value.usageAccountingComplete !== null &&
+      (value.callsStarted !== 2 || value.correctionKind !== null) &&
+      !(value.outcome === "validated" && value.callsStarted === 1 && value.correctionKind !== null) &&
+      value.phaseElapsedMs! >= value.firstCallElapsedMs! && value.firstCallRemainingMs! <= value.initialBudgetMs! &&
+      Math.abs(value.firstCallRemainingMs! - Math.max(0, value.initialBudgetMs! - value.firstCallElapsedMs!)) <= 1;
+  if (!shape) ctx.addIssue({ code: "custom", message: "unreachable adjudication measurement combination" });
+});
+
+export const adjudicationAttemptSchema = z.object({
+  outerAttempt: safeCounter.positive(), attemptResult: z.enum(["scored", "failed"]),
+  failureClass: z.enum(["envelopeInvalid", "operational", "processTimeout", "spawnFailure", "other"]).optional(),
+  phaseStart: z.enum(["unknown", "notStarted"]),
+  captureStatus: z.enum(["valid", "notObserved", "invalid", "duplicate"]),
+  captureDetail: z.literal("unterminatedAuthenticatedFrame").optional(),
+  producerFrameObserved: z.literal(true).optional(),
+  authenticity: z.literal("perAttemptNonceMatched").optional(),
+  summary: adjudicationSummarySchema.optional(),
+}).strict().superRefine((value, ctx) => {
+  if ((value.captureStatus === "valid") !== (value.summary !== undefined && value.authenticity !== undefined) ||
+      (value.captureStatus !== "valid" && (value.summary !== undefined || value.authenticity !== undefined)) ||
+      (value.phaseStart === "notStarted" && (value.failureClass !== "spawnFailure" || value.captureStatus !== "notObserved" || value.producerFrameObserved)) ||
+      (value.attemptResult === "scored" ? value.failureClass !== undefined : value.failureClass === undefined)) {
+    ctx.addIssue({ code: "custom", message: "inconsistent adjudication capture provenance" });
+  }
+});
+export type AdjudicationAttempt = z.infer<typeof adjudicationAttemptSchema>;
+
+export function decodeAdjudicationCapture(stderr: string, nonce: string): {
+  evidence: Omit<AdjudicationAttempt, "outerAttempt" | "attemptResult" | "failureClass">;
+  classifierStderr: string;
+} {
+  const challenge = [...nonce].map((nibble) => CAPTURE_ALPHABET[parseInt(nibble, 16)]).join("");
+  const header = `${ADJUDICATION_PREFIX}${challenge} `;
+  const trailer = ` ${challenge} ${encodeCaptureText("end")}`;
+  let classifierStderr = "", cursor = 0, count = 0;
+  let evidence: ReturnType<typeof decodeAdjudicationCapture>["evidence"] = { phaseStart: "unknown", captureStatus: "notObserved" };
+  for (;;) {
+    const start = stderr.indexOf("\x1e", cursor);
+    if (start < 0) { classifierStderr += stderr.slice(cursor); break; }
+    classifierStderr += stderr.slice(cursor, start);
+    // Public, partial and foreign prefixes are ordinary diagnostic bytes.
+    if (!stderr.startsWith(header, start)) {
+      classifierStderr += stderr[start];
+      cursor = start + 1;
+      continue;
+    }
+    count++;
+    const payloadStart = start + header.length;
+    const lineEnd = stderr.indexOf("\n", payloadStart);
+    const end = lineEnd < 0 ? stderr.length : lineEnd;
+    const close = stderr.indexOf(trailer, payloadStart);
+    if (close < 0 || close > end) {
+      cursor = payloadStart;
+      while (cursor < end && CAPTURE_ALPHABET.includes(stderr[cursor]!)) cursor++;
+      classifierStderr += "\n";
+      evidence = count > 1 ? { phaseStart: "unknown", captureStatus: "duplicate" }
+        : { phaseStart: "unknown", captureStatus: "notObserved", producerFrameObserved: true, captureDetail: "unterminatedAuthenticatedFrame" };
+      continue;
+    }
+    cursor = close + trailer.length;
+    const payload = stderr.slice(payloadStart, close);
+    const encoded = [...payload].every((char) => CAPTURE_ALPHABET.includes(char));
+    // Newlines keep neighboring diagnostics from forming a retry signature.
+    // Unencoded payload bytes can be ordinary errors and remain unchanged.
+    classifierStderr += encoded ? "\n" : stderr.slice(start, cursor);
+    if (count > 1) { evidence = { phaseStart: "unknown", captureStatus: "duplicate" }; continue; }
+    let parsed: ReturnType<typeof adjudicationSummarySchema.safeParse> | undefined;
+    if (Buffer.byteLength(stderr.slice(start, cursor)) + 1 <= CAPTURE_MAX_BYTES) {
+      if (encoded && payload.length % 2 === 0) {
+        const bytes = Buffer.alloc(payload.length / 2);
+        for (let i = 0; i < bytes.length; i++) {
+          bytes[i] = CAPTURE_ALPHABET.indexOf(payload[i * 2]!) * 16 + CAPTURE_ALPHABET.indexOf(payload[i * 2 + 1]!);
+        }
+        try { parsed = adjudicationSummarySchema.safeParse(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes))); } catch { /* Complete malformed frame. */ }
+      }
+    }
+    evidence = parsed?.success
+      ? { phaseStart: "unknown", captureStatus: "valid", authenticity: "perAttemptNonceMatched", summary: parsed.data }
+      : { phaseStart: "unknown", captureStatus: "invalid" };
+  }
+  return { evidence, classifierStderr };
+}
+
 export interface LiveCaseResult {
+  adjudicationEvidenceVersion?: 1;
+  adjudicationAttempts?: AdjudicationAttempt[];
   id: string;
   name: string;
   type: "defect" | "clean";
@@ -550,6 +665,7 @@ export function aggregateAttemptAccounting(
   const durationComplete = attempts.every((attempt) => attempt.durationMs !== null);
   return {
     ...finalAttempt,
+    adjudicationAttempts: attempts.flatMap((attempt) => attempt.adjudicationAttempts ?? []),
     durationMs: durationComplete
       ? attempts.reduce((sum, attempt) => sum + attempt.durationMs!, 0)
       : null,
@@ -596,7 +712,7 @@ const TRANSIENT_STDERR = new RegExp(
 /** True when an unscored case is worth one outer retry: the binary emitted a
  * transient signature, produced no valid envelope, or explicitly reported an
  * unrecovered review/invalidOutput incident. */
-function isTransientFailure(result: LiveCaseResult): boolean {
+export function isTransientFailure(result: LiveCaseResult): boolean {
   if (result.scored) return false;
   if (result.stderr && TRANSIENT_STDERR.test(result.stderr)) return true;
   if (result.error === "operational envelope: review/invalidOutput") return true;
@@ -697,6 +813,8 @@ async function runLiveCase(
   const diffPath = join(runDir, "pull.diff");
   await writeFile(diffPath, c.diff, { mode: 0o600 });
 
+  const nonce = randomBytes(16).toString("hex");
+  let processFailure: "processTimeout" | "spawnFailure" | undefined;
   let stdout = "";
   let stderr = "";
   let exitCode: number | undefined;
@@ -706,7 +824,7 @@ async function runLiveCase(
       liveReviewArguments(diffPath, options.bounded),
       {
         cwd: runDir,
-        env: liveEnv(
+        env: { ...liveEnv(
           options.model,
           options.scorerModel,
           options.screenProfilePath,
@@ -715,7 +833,7 @@ async function runLiveCase(
           provider,
           timeoutOverrides,
           captureApiBase,
-        ),
+        ), POSTIL_BENCH_ADJUDICATION_NONCE: nonce },
         timeout: timeoutOverrides.caseProcessMilliseconds,
         maxBuffer: 8 * 1024 * 1024,
       },
@@ -727,18 +845,28 @@ async function runLiveCase(
     // Exit 1 with a valid envelope is the gate failing on an error-severity
     // finding, not a transport failure. Keep the stdout and score it. The
     // stderr is captured so a genuine transport failure can be retried.
-    const e = err as { code?: unknown; stdout?: string; stderr?: string; message?: string };
+    const e = err as { code?: unknown; stdout?: string; stderr?: string; message?: string; killed?: boolean };
+    if (e.killed) processFailure = "processTimeout";
+    else if (e.code === "ENOENT" || e.code === "EACCES" || e.code === "ENOEXEC") processFailure = "spawnFailure";
     exitCode = typeof e.code === "number" ? e.code : undefined;
     stdout = e.stdout ?? "";
     stderr = e.stderr ?? e.message ?? "";
   }
   base.exitCode = exitCode;
-  base.stderr = stderr;
+  const capture = decodeAdjudicationCapture(stderr, nonce);
+  base.stderr = capture.classifierStderr;
+  base.adjudicationEvidenceVersion = 1;
+  const evidence: AdjudicationAttempt = {
+    ...capture.evidence, outerAttempt: attempt, attemptResult: "failed", failureClass: processFailure ?? "other",
+    ...(processFailure === "spawnFailure" ? { phaseStart: "notStarted" as const } : {}),
+  };
+  base.adjudicationAttempts = [evidence];
   await writeFile(join(runDir, "stdout.json"), stdout, { mode: 0o600 });
   await writeFile(join(runDir, "stderr.log"), stderr, { mode: 0o600 });
 
   const parsed = envelopeV1.safeParse(safeJson(stdout));
   if (!parsed.success) {
+    evidence.failureClass = processFailure ?? "envelopeInvalid";
     base.error = `no valid v1 envelope (exit ${exitCode ?? "unknown"})`;
     return base;
   }
@@ -750,11 +878,13 @@ async function runLiveCase(
   base.costAccountingComplete = observedCost.complete;
   const operationalFailure = envelopeOperationalFailure(parsed.data, options.model);
   if (operationalFailure) {
+    evidence.failureClass = "operational";
     base.error = operationalFailure;
     return base;
   }
   const scorerFailure = scorerOperationalFailure(parsed.data, options.scorerModel);
   if (scorerFailure) {
+    evidence.failureClass = "operational";
     base.error = scorerFailure;
     return base;
   }
@@ -766,6 +896,8 @@ async function runLiveCase(
       return base;
     }
   }
+  evidence.attemptResult = "scored";
+  delete evidence.failureClass;
   return scoreCase(base, truth, parsed.data);
 }
 

@@ -43,6 +43,7 @@ import {
 } from "./cohort";
 import {
   ADMISSION_API_BASE,
+  adjudicationAttemptSchema,
   evaluatorSourceSha256,
   screeningProfileMetadata,
 } from "./live";
@@ -140,6 +141,8 @@ const providerContractSchema = z.object({
 });
 
 const liveCaseResultSchema = z.object({
+  adjudicationEvidenceVersion: z.literal(1).optional(),
+  adjudicationAttempts: z.array(adjudicationAttemptSchema).optional(),
   id: nonemptyStringSchema,
   type: z.enum(["defect", "clean"]),
   scored: z.boolean(),
@@ -1287,6 +1290,9 @@ async function loadReports(paths: readonly string[]): Promise<LoadedReports> {
     }
     const report = liveReportSchema.safeParse(parsed);
     if (!report.success) {
+      if (report.error.issues.some((issue) => issue.path[0] === "results" && String(issue.path[2]).startsWith("adjudication"))) {
+        assertAdjudicationCapture(parsed as LiveReportForComparison, 1);
+      }
       throw new Error(`invalid release benchmark report at ${path}: ${report.error.message}`);
     }
     try {
@@ -1302,6 +1308,49 @@ async function loadReports(paths: readonly string[]): Promise<LoadedReports> {
     rawSha256: rawReports.map((report) => report.sha256),
     parsed: rawReports.map((report) => JSON.parse(report.raw.toString("utf8")) as unknown),
   };
+}
+
+export function assertAdjudicationCapture(report: LiveReportForComparison, retries: number): void {
+  for (const result of report.results) {
+    const refuse = (attempt: number, defect: string): never => {
+      throw new Error(`adjudication evidence qualification failed: case ${result.id}, original attempt ${attempt}: ${defect}; case verdict remains ${result.scored ? "scored" : "failed"}. No replacement call is permitted. Preserve original samples and any spent release tag; return the failure for a separately authorized future release decision.`);
+    };
+    const attempts = result.adjudicationAttempts;
+    if (result.adjudicationEvidenceVersion !== 1 || !Array.isArray(attempts) || attempts.length !== result.attemptCount || result.attemptCount > retries + 1) {
+      refuse(result.attemptCount, "missing capture capability or original attempt lineage");
+    }
+    for (const [index, attempt] of attempts!.entries()) {
+      const parsed = adjudicationAttemptSchema.safeParse(attempt);
+      if (!parsed.success) refuse(index + 1, `invalid capture field ${parsed.error.issues[0]?.path.join(".") || "provenance"}`);
+      if (attempt.outerAttempt !== index + 1 ||
+          attempt.attemptResult !== (index === attempts!.length - 1 && result.scored ? "scored" : "failed")) {
+        refuse(index + 1, "invalid capture provenance or attempt order");
+      }
+      if (attempt.captureStatus === "invalid" || attempt.captureStatus === "duplicate") refuse(index + 1, `${attempt.captureStatus} authenticated capture`);
+      if (index === attempts!.length - 1 && result.scored && (attempt.captureStatus !== "valid" || attempt.summary?.outcome === "failed")) refuse(index + 1, "missing complete successful final capture");
+    }
+  }
+}
+
+export function formatAdjudicationCapture(reports: readonly LiveReportForComparison[]): string {
+  const attempts = reports.flatMap((report) => report.results.flatMap((result) => result.adjudicationAttempts ?? []));
+  const invoked = attempts.filter((a) => a.captureStatus === "valid" && a.summary?.outcome !== "notRequired");
+  const zeroCandidates = attempts.filter((a) => a.captureStatus === "valid" && a.summary?.outcome === "notRequired").length;
+  const notStarted = attempts.filter((a) => a.phaseStart === "notStarted").length;
+  const unknown = attempts.filter((a) => a.captureStatus === "notObserved" && a.phaseStart !== "notStarted").length;
+  const invalid = attempts.filter((a) => a.captureStatus === "invalid" || a.captureStatus === "duplicate").length;
+  const corrections = invoked.filter((a) => a.summary?.callsStarted === 2);
+  const recovered = corrections.filter((a) => a.summary?.outcome === "validated").length;
+  const finalCaptured = attempts.filter((a) => a.attemptResult === "scored" && a.captureStatus === "valid").length;
+  const firstValid = invoked.filter((a) => a.summary?.callsStarted === 1 && a.summary.outcome === "validated").length;
+  const selected = invoked.filter((a) => a.summary?.callsStarted === 1 && a.summary.correctionKind !== null).length;
+  const firstFailed = invoked.length - corrections.length - firstValid - selected;
+  return `Adjudication evidence: ${attempts.length} original attempts; ${finalCaptured} final summaries captured; ` +
+    `${invoked.length} invoked terminal summaries; ${zeroCandidates} zero-candidate runs; ${unknown} attempts with unknown measurements; ` +
+    `${notStarted} proven spawn failures; ${invalid} integrity defects.\n` +
+    `Captured logical calls: ${firstValid} first-call successes; ${selected} selected corrections not entered; ${firstFailed} first-call failures without correction.\n` +
+    `Correction recovery (captured subset): ${corrections.length === 0 ? "unmeasured" : `${recovered}/${corrections.length}`}; ` +
+    `${unknown} unknown attempts retain unknown correction incidence and recovery.`;
 }
 
 export interface VerifiedCohortEvidence {
@@ -1371,6 +1420,7 @@ export function assertCompleteCohortEvidence(options: {
         `benchmark report slot ${slot.slot} exceeds its manifest outer retry allowance`,
       );
     }
+    assertAdjudicationCapture(report, manifest.caseRetries);
     if (receipt.reportRawSha256 !== options.rawReportSha256[index]) {
       throw new Error(`benchmark report slot ${slot.slot} raw digest does not match its receipt`);
     }
@@ -1542,6 +1592,7 @@ async function main() {
       record,
     });
   }
+  if (cohortEvidence !== undefined) console.log(formatAdjudicationCapture(reports));
   const observed = aggregateObservedMetrics(reports);
   const rebaselineGuidance = formatRebaselineGuidance({
     binaryPath,
