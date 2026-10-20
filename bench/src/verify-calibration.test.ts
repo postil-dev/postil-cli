@@ -1,13 +1,17 @@
 import { afterEach, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { evaluatorSourceSha256 } from "./live";
 import { calibrationMain, validateCalibrationDispatch, verifyLegacyCalibration } from "./verify-calibration";
 
 const root = resolve(import.meta.dir, "../..");
+const historicalSource = "356ba691999c737551506039d2ad4bc26c6c1354";
+const historicalImport = "7ae07f4c2c62256d837860deb76e498706e3ac5b";
+const historicalBytes = (source: string, path: string) =>
+  execFileSync("git", ["show", `${source}:${path}`], { cwd: root });
 const temporary: string[] = [];
 const candidate = randomBytes(20).toString("hex");
 const admission = {
@@ -27,13 +31,15 @@ async function fixture() {
   const paths: string[] = JSON.parse(await readFile(resolve(root, "bench/evaluator-contract-sources.json"), "utf8"));
   for (const path of [...paths, "bench/baseline-us.json", "bench/baseline-us.attestation.json", "provisional-models-us.json"]) {
     await mkdir(dirname(resolve(directory, path)), { recursive: true });
-    await cp(resolve(root, path), resolve(directory, path));
+    const source = paths.includes(path) ? historicalSource : historicalImport;
+    await writeFile(resolve(directory, path), historicalBytes(source, path));
   }
   return directory;
 }
 
 async function transport() {
-  const bundle = JSON.parse(await readFile(resolve(root, "bench/baseline-us.attestation.json"), "utf8"));
+  const historicalRoot = await fixture();
+  const bundle = JSON.parse(await readFile(resolve(historicalRoot, "bench/baseline-us.attestation.json"), "utf8"));
   const statement = JSON.parse(Buffer.from(bundle.dsseEnvelope.payload, "base64").toString("utf8"));
   const calls: string[][] = [];
   const runGh = async (args: string[]) => {
@@ -45,7 +51,7 @@ async function transport() {
     } }]);
   };
   const runGit = async (args: string[]) => execFileSync("git", args, { cwd: root });
-  return { runGh, runGit, calls, statement };
+  return { root: historicalRoot, runGh, runGit, calls, statement };
 }
 
 test("default admission retains all four effective required inputs without granting calibration authority", async () => {
@@ -82,7 +88,8 @@ test("frozen historical evidence stays legacy-only and pins the actual signature
   const context = await transport();
   const result = await verifyLegacyCalibration(context);
   expect(result).toMatchObject({ protocol: "legacy-v2", behaviorCompatibility: "UNKNOWN", observedRuntimeIdentity: "UNKNOWN", executionEnabled: false });
-  expect(result.evaluatorSha256).toBe(await evaluatorSourceSha256());
+  const baseline = JSON.parse(await readFile(resolve(context.root, "bench/baseline-us.json"), "utf8"));
+  expect(result.evaluatorSha256).toBe(baseline.corpus.evaluatorSha256);
   expect(result.workflowRunId).toBe("35951227818");
   expect(result).not.toHaveProperty("effectiveConcurrency");
   expect(result).not.toHaveProperty("behaviorSha256");
@@ -95,6 +102,127 @@ test("frozen historical evidence stays legacy-only and pins the actual signature
   expect(values["--cert-oidc-issuer"]).toBe("https://token.actions.githubusercontent.com");
   expect(values["--predicate-type"]).toBe("https://slsa.dev/provenance/v1");
   expect(verification).toContain("--deny-self-hosted-runners");
+});
+
+test("current evaluator sources cannot reuse the historical calibration", async () => {
+  const context = await transport();
+  const paths: string[] = JSON.parse(await readFile(resolve(root, "bench/evaluator-contract-sources.json"), "utf8"));
+  for (const path of paths) await cp(resolve(root, path), resolve(context.root, path));
+  const baseline = JSON.parse(await readFile(resolve(context.root, "bench/baseline-us.json"), "utf8"));
+  expect(await evaluatorSourceSha256()).not.toBe(baseline.corpus.evaluatorSha256);
+  await expect(verifyLegacyCalibration(context)).rejects.toThrow("evaluator is stale");
+  expect(context.calls).toHaveLength(0);
+});
+
+test("calibration workflow verifies retained provenance before reserving a changed current-main evaluator", async () => {
+  const workflow = Bun.YAML.parse(await readFile(resolve(root, ".github/workflows/benchmark-calibration.yml"), "utf8")) as {
+    jobs: { validate: { steps: { name?: string; run?: string }[] } };
+  };
+  const steps = workflow.jobs.validate.steps;
+  const script = (name: string) => {
+    const step = steps.find(value => value.name === name);
+    expect(step?.run).toBeDefined();
+    return step!.run!;
+  };
+  const initial = script("Verify the current main calibration source");
+  const validation = script("Verify the calibration baseline input");
+  const reservation = script("Reserve the current main calibration source");
+  expect(steps.findIndex(step => step.name === "Verify embedded model admission")).toBeLessThan(
+    steps.findIndex(step => step.name === "Verify the calibration baseline input"),
+  );
+  expect(steps.findIndex(step => step.name === "Verify the calibration baseline input")).toBeLessThan(
+    steps.findIndex(step => step.name === "Reserve the current main calibration source"),
+  );
+  const directory = await fixture();
+  const baselinePath = resolve(directory, "bench/baseline-us.json");
+  const baselineBytes = await readFile(baselinePath);
+  const baseline = JSON.parse(baselineBytes.toString());
+  const source = baseline.profiles["openai/gpt-5.6-luna"].calibration.sourceSha;
+  const bin = resolve(directory, "bin");
+  await mkdir(bin);
+  const callsPath = resolve(directory, "calls");
+  const shim = resolve(bin, "gh");
+  await writeFile(shim, `#!/bin/bash
+set -euo pipefail
+printf '%s\\t' "$@" >> "$CALLS_FILE"
+printf '\\n' >> "$CALLS_FILE"
+if [[ "$1" == api ]]; then
+  case "$*" in
+    *'--method POST'*) exit "$RESERVATION_EXIT" ;;
+    *'heads/main'*) printf '%s' "$MAIN_SHA" ;;
+    *) printf '%s' "$REGISTRY_SHA" ;;
+  esac
+else
+  exit "$VERIFICATION_EXIT"
+fi
+`);
+  await chmod(shim, 0o700);
+  const currentEvaluator = await evaluatorSourceSha256();
+  const run = async (options: Record<string, string> = {}) => {
+    await writeFile(callsPath, "");
+    const child = Bun.spawn(["bash", "-c", initial + "\n(\n" + validation + "\n)\n" + reservation], {
+      cwd: directory, stdout: "pipe", stderr: "pipe", timeout: 10_000,
+      env: {
+        PATH: `${bin}:${process.env.PATH}`, CALLS_FILE: callsPath,
+        GITHUB_REF: "refs/heads/main", GITHUB_RUN_ATTEMPT: "1", GITHUB_SHA: candidate,
+        GITHUB_REPOSITORY: "postil-dev/postil-cli", MAIN_SHA: candidate,
+        REGISTRY_SHA: source, VERIFICATION_EXIT: "0", RESERVATION_EXIT: "0",
+        CURRENT_EVALUATOR_SHA256: currentEvaluator, ...options,
+      },
+    });
+    const [code, stdout, stderr] = await Promise.all([
+      child.exited, new Response(child.stdout).text(), new Response(child.stderr).text(),
+    ]);
+    const calls = (await readFile(callsPath, "utf8")).trim().split("\n").filter(Boolean).map(line => line.trim().split("\t"));
+    return { code, output: stdout + stderr, calls };
+  };
+  const accepted = await run();
+  expect(accepted.code).toBe(0);
+  const verification = accepted.calls.find(args => args[0] === "attestation")!;
+  expect(verification).toEqual([
+    "attestation", "verify", "bench/baseline-us.json", "--bundle", "bench/baseline-us.attestation.json",
+    "--repo", "postil-dev/postil-cli", "--signer-workflow", "postil-dev/postil-cli/.github/workflows/benchmark-calibration.yml",
+    "--signer-digest", source, "--source-digest", source, "--source-ref", "refs/heads/main",
+    "--cert-oidc-issuer", "https://token.actions.githubusercontent.com", "--predicate-type", "https://slsa.dev/provenance/v1",
+    "--deny-self-hosted-runners", "--format", "json",
+  ]);
+  expect(accepted.calls.at(-1)).toContain(`ref=refs/tags/postil-calibration-${candidate}`);
+  for (const [options, message] of [
+    [{ GITHUB_REF: "refs/heads/topic" }, "only from main"],
+    [{ GITHUB_RUN_ATTEMPT: "2" }, "retries are not authoritative"],
+    [{ MAIN_SHA: source }, "not the current main commit"],
+    [{ GITHUB_SHA: source, MAIN_SHA: source }, "requires a new main source commit"],
+    [{ CURRENT_EVALUATOR_SHA256: baseline.corpus.evaluatorSha256 }, "changed evaluator contract"],
+    [{ CURRENT_EVALUATOR_SHA256: "invalid" }, "evaluator digest is invalid"],
+    [{ REGISTRY_SHA: candidate }, "registry source mismatch"],
+    [{ VERIFICATION_EXIT: "1" }, ""],
+  ] as const) {
+    const refused = await run(options);
+    expect(refused.code).not.toBe(0);
+    expect(refused.output).toContain(message);
+    expect(refused.calls.some(args => args.includes("POST"))).toBe(false);
+  }
+  expect((await run({ RESERVATION_EXIT: "1" })).code).not.toBe(0);
+  for (const update of [
+    { profiles: {} },
+    { profiles: { "openai/gpt-5.6-luna": { populated: "false" } } },
+    { profiles: { "openai/gpt-5.6-luna": { populated: true, calibration: { sourceSha: "invalid" } } } },
+    { ...baseline, corpus: { evaluatorSha256: "invalid" } },
+  ]) {
+    await writeFile(baselinePath, JSON.stringify(update));
+    const refused = await run();
+    expect(refused.code).not.toBe(0);
+    expect(refused.calls.some(args => args.includes("POST"))).toBe(false);
+  }
+  await writeFile(baselinePath, baselineBytes);
+  await writeFile(resolve(directory, "bench/baseline-us.attestation.json"), "");
+  const missingBundle = await run();
+  expect(missingBundle.output).toContain("requires the retained baseline attestation");
+  expect(missingBundle.calls.some(args => args.includes("POST"))).toBe(false);
+  await writeFile(baselinePath, JSON.stringify({ profiles: { "openai/gpt-5.6-luna": { populated: false } } }));
+  const bootstrap = await run();
+  expect(bootstrap.code).toBe(0);
+  expect(bootstrap.calls.some(args => args[0] === "attestation")).toBe(false);
 });
 
 test("actual evaluator, effective-launch and workflow mutations invalidate legacy freshness", async () => {

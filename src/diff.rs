@@ -1439,6 +1439,8 @@ impl ModelBatchSpool {
         &mut self,
         selected_limit: usize,
     ) -> Result<BoundedCoverageReceipt> {
+        #[cfg(test)]
+        tests::SOURCE_PACKING_RECEIPTS.with(|receipts| receipts.set(receipts.get() + 1));
         anyhow::ensure!(
             selected_limit > 0,
             "bounded review batch limit must be positive"
@@ -2480,6 +2482,125 @@ pub(crate) fn spool_model_batches_with_synthesis_budget(
     force_empty: bool,
     semantic_receipt_limit: usize,
 ) -> Result<ModelBatchSpool> {
+    spool_model_batches_guarded(
+        prepared,
+        max_source_batch_bytes,
+        max_synthesis_batch_bytes,
+        max_manifest_bytes,
+        force_empty,
+        semantic_receipt_limit,
+        None,
+    )
+}
+
+pub(crate) fn spool_model_batches_for_review(
+    prepared: &mut PreparedReview,
+    max_source_batch_bytes: usize,
+    max_synthesis_batch_bytes: usize,
+    max_manifest_bytes: usize,
+    force_empty: bool,
+    semantic_receipt_limit: usize,
+    bounded: bool,
+) -> Result<ModelBatchSpool> {
+    spool_model_batches_guarded(
+        prepared,
+        max_source_batch_bytes,
+        max_synthesis_batch_bytes,
+        max_manifest_bytes,
+        force_empty,
+        semantic_receipt_limit,
+        Some(bounded),
+    )
+}
+
+fn spool_model_batches_guarded(
+    prepared: &mut PreparedReview,
+    max_source_batch_bytes: usize,
+    max_synthesis_batch_bytes: usize,
+    max_manifest_bytes: usize,
+    force_empty: bool,
+    semantic_receipt_limit: usize,
+    bounded: Option<bool>,
+) -> Result<ModelBatchSpool> {
+    anyhow::ensure!(
+        semantic_receipt_limit > 0,
+        "bounded review batch limit must be positive"
+    );
+    let mut candidate = spool_model_batches_with_packing(
+        prepared,
+        max_source_batch_bytes,
+        max_synthesis_batch_bytes,
+        max_manifest_bytes,
+        force_empty,
+        semantic_receipt_limit,
+        true,
+    )?;
+    // Mirror the caller's route boundaries. A provider's five-batch choice is
+    // outside the deterministic coverage proof, so it keeps next-fit inventory.
+    let provider_selection = bounded.is_some_and(|bounded| {
+        candidate.count <= semantic_receipt_limit
+            && !(crate::config::hosted_runtime_mode()
+                && !bounded
+                && candidate.source_count > crate::review::MAX_HOSTED_SELECTED_BATCHES)
+            && (bounded || crate::config::bounded_review_selection_mode())
+            && candidate.count > crate::review::MAX_HOSTED_SELECTED_BATCHES
+    });
+    // Mandatory hunks select their materialized source batches first. When all
+    // source batches fit, their complete ownership fits without a guard receipt.
+    if !provider_selection && candidate.source_count <= semantic_receipt_limit {
+        candidate
+            .file
+            .seek(SeekFrom::Start(0))
+            .context("rewinding capacity-packed model batches")?;
+        return Ok(candidate);
+    }
+    // Releasing both the file and its quota lease precedes the baseline build.
+    // Return the complete baseline inventory, including its semantic evidence.
+    drop(candidate);
+    spool_model_batches_next_fit(
+        prepared,
+        max_source_batch_bytes,
+        max_synthesis_batch_bytes,
+        max_manifest_bytes,
+        force_empty,
+        semantic_receipt_limit,
+    )
+}
+
+pub(crate) fn spool_model_batches_next_fit(
+    prepared: &mut PreparedReview,
+    max_source_batch_bytes: usize,
+    max_synthesis_batch_bytes: usize,
+    max_manifest_bytes: usize,
+    force_empty: bool,
+    semantic_receipt_limit: usize,
+) -> Result<ModelBatchSpool> {
+    spool_model_batches_with_packing(
+        prepared,
+        max_source_batch_bytes,
+        max_synthesis_batch_bytes,
+        max_manifest_bytes,
+        force_empty,
+        semantic_receipt_limit,
+        false,
+    )
+}
+
+fn spool_model_batches_with_packing(
+    prepared: &mut PreparedReview,
+    max_source_batch_bytes: usize,
+    max_synthesis_batch_bytes: usize,
+    max_manifest_bytes: usize,
+    force_empty: bool,
+    semantic_receipt_limit: usize,
+    reuse_capacity: bool,
+) -> Result<ModelBatchSpool> {
+    #[cfg(test)]
+    tests::SOURCE_PACKING_BUILDS.with(|builds| {
+        builds
+            .borrow_mut()
+            .push(prepared._window_lease.budget.retained_bytes());
+    });
     anyhow::ensure!(
         max_source_batch_bytes >= MIN_REVIEW_BATCH_BYTES,
         "source batch limit must leave room for context"
@@ -2541,12 +2662,13 @@ pub(crate) fn spool_model_batches_with_synthesis_budget(
                 }
             }
         }
-        let plan = render_review_batches(
+        let plan = render_review_batches_with_packing(
             &parsed,
             &[],
             &[],
             max_source_batch_bytes,
             max_manifest_bytes,
+            reuse_capacity,
         );
         anyhow::ensure!(
             !plan.incomplete,
@@ -2636,12 +2758,13 @@ pub(crate) fn spool_model_batches_with_synthesis_budget(
     {
         let lock_end = (lock_start + 16).min(prepared.lockfiles.len());
         let artifact_end = (artifact_start + 16).min(prepared.compacted_artifacts.len());
-        let plan = render_review_batches(
+        let plan = render_review_batches_with_packing(
             &Diff::default(),
             &prepared.lockfiles[lock_start..lock_end],
             &prepared.compacted_artifacts[artifact_start..artifact_end],
             max_source_batch_bytes,
             max_manifest_bytes,
+            reuse_capacity,
         );
         if plan.incomplete {
             anyhow::bail!("compact artifact metadata could not fit a bounded model request");
@@ -5012,6 +5135,24 @@ pub fn render_review_batches(
     max_bytes: usize,
     max_manifest_bytes: usize,
 ) -> ReviewBatchPlan {
+    render_review_batches_with_packing(
+        diff,
+        lockfiles,
+        compacted_artifacts,
+        max_bytes,
+        max_manifest_bytes,
+        true,
+    )
+}
+
+fn render_review_batches_with_packing(
+    diff: &Diff,
+    lockfiles: &[LockfileEvidence],
+    compacted_artifacts: &[CompactedArtifactEvidence],
+    max_bytes: usize,
+    max_manifest_bytes: usize,
+    reuse_capacity: bool,
+) -> ReviewBatchPlan {
     assert!(
         max_bytes >= MIN_REVIEW_BATCH_BYTES,
         "review batch limit must leave room for context"
@@ -5027,8 +5168,8 @@ pub fn render_review_batches(
         return plan;
     }
 
-    let mut current = String::new();
-    let mut current_hunks = BTreeSet::new();
+    let mut packing = SourceBatchPacking::new(&manifest.text);
+    packing.reuse_capacity = reuse_capacity;
     for file in &diff.files {
         if file.binary || file.hunks.is_empty() {
             continue;
@@ -5044,24 +5185,16 @@ pub fn render_review_batches(
                 return plan;
             };
             for unit in units {
-                if !append_unit(
-                    &mut plan,
-                    &mut current,
-                    &mut current_hunks,
-                    &manifest.text,
-                    &unit,
-                    &hunk_identity,
-                    max_bytes,
-                ) {
+                if !append_unit(&mut plan, &mut packing, &unit, &hunk_identity, max_bytes) {
                     plan.incomplete = true;
                     return plan;
                 }
             }
         }
     }
-    if !current.is_empty() {
-        plan.batches.push(current);
-        plan.batch_hunks.push(current_hunks);
+    if !packing.current.is_empty() {
+        plan.batches.push(packing.current);
+        plan.batch_hunks.push(packing.current_hunks);
     } else if plan.batches.is_empty()
         && (!diff.files.is_empty() || !lockfiles.is_empty() || !compacted_artifacts.is_empty())
     {
@@ -5430,29 +5563,69 @@ fn render_line_segments_with_budget(
     rendered
 }
 
+struct SourceBatchPacking {
+    reuse_capacity: bool,
+    initial: String,
+    initial_bytes: usize,
+    current: String,
+    current_hunks: BTreeSet<HunkIdentity>,
+    current_bytes: usize,
+    closed_bytes: Vec<usize>,
+}
+
+impl SourceBatchPacking {
+    fn new(manifest: &str) -> Self {
+        let initial = format!("{manifest}\n");
+        let initial_bytes = json_string_content_bytes(&initial);
+        Self {
+            reuse_capacity: true,
+            initial,
+            initial_bytes,
+            current: String::new(),
+            current_hunks: BTreeSet::new(),
+            current_bytes: 0,
+            closed_bytes: Vec::new(),
+        }
+    }
+}
+
 fn append_unit(
     plan: &mut ReviewBatchPlan,
-    current: &mut String,
-    current_hunks: &mut BTreeSet<HunkIdentity>,
-    manifest: &str,
+    packing: &mut SourceBatchPacking,
     unit: &str,
     hunk: &HunkIdentity,
     max_bytes: usize,
 ) -> bool {
-    let initial = format!("{manifest}\n");
-    if json_string_content_bytes(&initial) + json_string_content_bytes(unit) > max_bytes {
+    let unit_bytes = json_string_content_bytes(unit);
+    if packing.initial_bytes + unit_bytes > max_bytes {
         return false;
     }
-    if current.is_empty() {
-        current.push_str(&initial);
+    if packing.current.is_empty() {
+        packing.current.push_str(&packing.initial);
+        packing.current_bytes = packing.initial_bytes;
     }
-    if json_string_content_bytes(current) + json_string_content_bytes(unit) > max_bytes {
-        plan.batches.push(std::mem::take(current));
-        plan.batch_hunks.push(std::mem::take(current_hunks));
-        current.push_str(&initial);
+    if packing.current_bytes + unit_bytes > max_bytes {
+        if packing.reuse_capacity
+            && let Some(index) = packing
+                .closed_bytes
+                .iter()
+                .position(|size| size + unit_bytes <= max_bytes)
+        {
+            plan.batches[index].push_str(unit);
+            plan.batch_hunks[index].insert(hunk.clone());
+            packing.closed_bytes[index] += unit_bytes;
+            return true;
+        }
+        plan.batches.push(std::mem::take(&mut packing.current));
+        plan.batch_hunks
+            .push(std::mem::take(&mut packing.current_hunks));
+        packing.closed_bytes.push(packing.current_bytes);
+        packing.current.push_str(&packing.initial);
+        packing.current_bytes = packing.initial_bytes;
     }
-    current.push_str(unit);
-    current_hunks.insert(hunk.clone());
+    packing.current.push_str(unit);
+    packing.current_hunks.insert(hunk.clone());
+    packing.current_bytes += unit_bytes;
     true
 }
 
@@ -6095,6 +6268,560 @@ pub fn render_hunk_context(diff: &Diff, path: &str, line: u32, radius: u32) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        pub(super) static SOURCE_PACKING_BUILDS: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+        pub(super) static SOURCE_PACKING_RECEIPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn capacity_coverage_fixture(budget: usize, prefix: usize) -> String {
+        let mut paths = (0..prefix)
+            .map(|i| format!("src/auth/{i:02}.rs"))
+            .chain(["src/a.rs", "src/b.rs", "src/auth/c.rs", "src/auth/d.rs"].map(String::from))
+            .collect::<Vec<_>>();
+        let manifest = format!(
+            "Changed-file manifest:\n{}\n",
+            paths
+                .iter()
+                .map(|p| format!("- {p} [source]\n"))
+                .collect::<String>()
+        );
+        let padding = 792 - json_string_content_bytes(&manifest);
+        paths[0] = paths[0].replace(".rs", &format!("{}.rs", "x".repeat(padding)));
+        let available = budget - 792;
+        let tail = if budget == 32_768 {
+            [19_182, 22_379, 12_788, 9_591]
+        } else {
+            [
+                available * 60 / 100,
+                available * 70 / 100,
+                available * 40 / 100,
+                available * 30 / 100,
+            ]
+        };
+        let sizes = std::iter::repeat_n(available - 200, prefix).chain(tail);
+        let lines = if budget == 32_768 { 40 } else { 4 };
+        let mut source = String::new();
+        for (path, size) in paths.into_iter().zip(sizes) {
+            let header = format!("### {path}\n@@ segment starting near new line 1 @@\n");
+            let overhead = json_string_content_bytes(&header)
+                + (1..=lines)
+                    .map(|i| json_string_content_bytes(&format!("{i:>6} + \n")))
+                    .sum::<usize>();
+            let payload = size - overhead;
+            source.push_str(&format!(
+                "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -0,0 +1,{lines} @@\n"
+            ));
+            for i in 0..lines {
+                let width = payload / lines + usize::from(i < payload % lines);
+                assert!(width <= MAX_RENDERED_EVIDENCE_BYTES);
+                source.push_str(&format!("+{}\n", "x".repeat(width)));
+            }
+        }
+        source
+    }
+
+    fn model_spool_bytes(spool: &mut ModelBatchSpool) -> Vec<u8> {
+        assert_eq!(spool.file.stream_position().unwrap(), 0);
+        let mut bytes = Vec::new();
+        spool.file.read_to_end(&mut bytes).unwrap();
+        spool.file.seek(SeekFrom::Start(0)).unwrap();
+        bytes
+    }
+
+    fn assert_same_model_spool(
+        left: &mut ModelBatchSpool,
+        right: &mut ModelBatchSpool,
+        limit: usize,
+    ) {
+        assert_eq!(model_spool_bytes(left), model_spool_bytes(right));
+        assert_eq!(
+            (left.count, left.source_count, left.metadata_count),
+            (right.count, right.source_count, right.metadata_count)
+        );
+        assert_eq!(left.batch_hunks, right.batch_hunks);
+        assert_eq!(left.all_hunks, right.all_hunks);
+        assert_eq!(left.synthesis_ids, right.synthesis_ids);
+        assert_eq!(left.exact_semantic_ids, right.exact_semantic_ids);
+        assert_eq!(left.metadata_batch_ids, right.metadata_batch_ids);
+        let risks = |s: &ModelBatchSpool| {
+            s.hunk_risk
+                .iter()
+                .map(|(h, r)| (h.clone(), (r.mandatory, r.semantic_eligible, r.score)))
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert_eq!(risks(left), risks(right));
+        let receipt = left.deterministic_bounded_receipt(limit).unwrap();
+        assert_eq!(receipt, left.deterministic_bounded_receipt(limit).unwrap());
+        assert_eq!(receipt, right.deterministic_bounded_receipt(limit).unwrap());
+        for _ in 0..left.count {
+            assert_eq!(left.next_batch().unwrap(), right.next_batch().unwrap());
+        }
+        assert!(left.next_batch().unwrap().is_none());
+        assert!(right.next_batch().unwrap().is_none());
+        left.file.seek(SeekFrom::Start(0)).unwrap();
+        right.file.seek(SeekFrom::Start(0)).unwrap();
+    }
+
+    fn mandatory_direct(spool: &mut ModelBatchSpool, limit: usize) -> BTreeSet<HunkIdentity> {
+        spool
+            .deterministic_bounded_receipt(limit)
+            .unwrap()
+            .entries
+            .into_iter()
+            .filter_map(|e| {
+                (spool.hunk_risk.get(&e.hunk).is_none_or(|r| r.mandatory)
+                    && matches!(e.disposition, HunkDisposition::Direct { .. }))
+                .then_some(e.hunk)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn source_packing_preserves_mandatory_identity_at_actual_admission() {
+        let source = capacity_coverage_fixture(32_768, 22);
+        let parsed = parse(&source);
+        assert_eq!(
+            json_string_content_bytes(&format!(
+                "{}\n",
+                build_manifest(&parsed, &[], &[], 10_922).text
+            )),
+            792
+        );
+        let sizes = parsed
+            .files
+            .iter()
+            .flat_map(|f| {
+                f.hunks
+                    .iter()
+                    .flat_map(|h| render_hunk_units(f, h, 31_974).unwrap())
+            })
+            .map(|u| serde_json::to_vec(&u).unwrap().len() - 2)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sizes,
+            std::iter::repeat_n(31_776, 22)
+                .chain([19_182, 22_379, 12_788, 9_591])
+                .collect::<Vec<_>>()
+        );
+        let cfg = crate::config::Config {
+            scorer_enabled: true,
+            scorer: crate::config::default_scorer_model().to_string(),
+            ..Default::default()
+        };
+        let limit = crate::review::MAX_LARGE_DIFF_SELECTED_BATCHES
+            .min(crate::llm::max_hosted_review_batches(&cfg, false).unwrap());
+        assert_eq!(limit, 23);
+        let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+        let mut prepared = prepare_review(&snapshot).unwrap();
+        let mut baseline =
+            spool_model_batches_next_fit(&mut prepared, 32_768, 32_768, 10_922, false, limit)
+                .unwrap();
+        let mut candidate = spool_model_batches_with_packing(
+            &mut prepared,
+            32_768,
+            32_768,
+            10_922,
+            false,
+            limit,
+            true,
+        )
+        .unwrap();
+        assert_eq!((baseline.source_count, candidate.source_count), (25, 24));
+        let d = HunkIdentity::new("src/auth/d.rs", &parsed.files[25].hunks[0]);
+        assert_eq!(
+            d.canonical(),
+            [
+                "src/auth/d.rs",
+                "0",
+                "0",
+                "1",
+                "40",
+                "ae0333e57ce9e78124abb29d2d3191486b4ce269f0994756b92b943e38be01f6"
+            ]
+            .join("\0")
+        );
+        let b = baseline.deterministic_bounded_receipt(limit).unwrap();
+        let c = candidate.deterministic_bounded_receipt(limit).unwrap();
+        assert_eq!((b.direct_hunks(), b.unreviewed_hunks()), (24, 2));
+        assert_eq!((c.direct_hunks(), c.unreviewed_hunks()), (24, 2));
+        assert!(
+            b.entries
+                .iter()
+                .any(|e| e.hunk == d && matches!(e.disposition, HunkDisposition::Direct { .. }))
+        );
+        assert!(c.entries.iter().any(|e| e.hunk==d && matches!(e.disposition,HunkDisposition::Unreviewed {..})));
+        let mut guarded = spool_model_batches_with_synthesis_budget(
+            &mut prepared,
+            32_768,
+            32_768,
+            10_922,
+            false,
+            limit,
+        )
+        .unwrap();
+        assert!(mandatory_direct(&mut guarded, limit).contains(&d));
+        assert_same_model_spool(&mut guarded, &mut baseline, limit);
+    }
+
+    #[test]
+    fn source_packing_guard_matches_whole_layout_and_releases_lease() {
+        for budget in [4096, 32_768] {
+            for prefix in [0, 3, 8] {
+                let source = capacity_coverage_fixture(budget, prefix);
+                for limit in [1, 3, 5, 23, 96] {
+                    let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+                    let mut prepared = prepare_review(&snapshot).unwrap();
+                    let quota = prepared._window_lease.budget.clone();
+                    let preparation = quota.retained_bytes();
+                    let synthesis = if prefix == 3 { 4096 } else { budget };
+                    let mut candidate = spool_model_batches_with_packing(
+                        &mut prepared,
+                        budget,
+                        synthesis,
+                        1024,
+                        false,
+                        limit,
+                        true,
+                    )
+                    .unwrap();
+                    let c_bytes = candidate._lease.bytes;
+                    let keep_candidate = candidate.source_count <= limit;
+                    if keep_candidate {
+                        let receipt = candidate.deterministic_bounded_receipt(limit).unwrap();
+                        assert!(
+                            candidate
+                                .hunk_risk
+                                .iter()
+                                .filter(|(_, risk)| risk.mandatory)
+                                .all(|(hunk, _)| receipt.entries.iter().any(|entry| &entry.hunk
+                                    == hunk
+                                    && matches!(
+                                        entry.disposition,
+                                        HunkDisposition::Direct { .. }
+                                    )))
+                        );
+                    }
+                    let mut baseline = spool_model_batches_next_fit(
+                        &mut prepared,
+                        budget,
+                        synthesis,
+                        1024,
+                        false,
+                        limit,
+                    )
+                    .unwrap();
+                    let b_bytes = baseline._lease.bytes;
+                    let expected_direct = mandatory_direct(&mut baseline, limit);
+                    let mut reference = if keep_candidate {
+                        drop(baseline);
+                        candidate
+                    } else {
+                        drop(candidate);
+                        baseline
+                    };
+                    let expected_bytes = model_spool_bytes(&mut reference);
+                    drop(reference);
+                    assert_eq!(quota.retained_bytes(), preparation);
+                    // Exactly one model spool fits. A retained C lease would make fallback fail.
+                    prepared._window_lease.budget.limit = preparation + c_bytes.max(b_bytes);
+                    SOURCE_PACKING_BUILDS.with(|b| b.borrow_mut().clear());
+                    SOURCE_PACKING_RECEIPTS.with(|receipts| receipts.set(0));
+                    let mut guarded = spool_model_batches_with_synthesis_budget(
+                        &mut prepared,
+                        budget,
+                        synthesis,
+                        1024,
+                        false,
+                        limit,
+                    )
+                    .unwrap();
+                    assert_eq!(SOURCE_PACKING_RECEIPTS.with(|receipts| receipts.get()), 0);
+                    let builds = SOURCE_PACKING_BUILDS.with(|b| b.borrow().clone());
+                    assert_eq!(
+                        builds,
+                        vec![preparation; if keep_candidate { 1 } else { 2 }]
+                    );
+                    assert_eq!(model_spool_bytes(&mut guarded), expected_bytes);
+                    assert!(expected_direct.is_subset(&mandatory_direct(&mut guarded, limit)));
+                    assert_eq!(quota.retained_bytes(), preparation + guarded._lease.bytes);
+                    drop(guarded);
+                    assert_eq!(quota.retained_bytes(), preparation);
+                    prepared._window_lease.budget.limit = MAX_REVIEW_SPOOL_BYTES;
+                    let mut first = spool_model_batches_with_synthesis_budget(
+                        &mut prepared,
+                        budget,
+                        synthesis,
+                        1024,
+                        false,
+                        limit,
+                    )
+                    .unwrap();
+                    let mut repeated = spool_model_batches_with_synthesis_budget(
+                        &mut prepared,
+                        budget,
+                        synthesis,
+                        1024,
+                        false,
+                        limit,
+                    )
+                    .unwrap();
+                    assert_same_model_spool(&mut first, &mut repeated, limit);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn source_packing_source_count_keeps_candidate_above_total_limit_without_receipt() {
+        let source = capacity_coverage_fixture(32_768, 3);
+        let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+        let mut prepared = prepare_review(&snapshot).unwrap();
+        let candidate =
+            spool_model_batches_with_packing(&mut prepared, 32_768, 32_768, 1024, false, 24, true)
+                .unwrap();
+        let limit = candidate.source_count;
+        drop(candidate);
+        let mut candidate = spool_model_batches_with_packing(
+            &mut prepared,
+            32_768,
+            32_768,
+            1024,
+            false,
+            limit,
+            true,
+        )
+        .unwrap();
+        assert!(candidate.count > limit);
+        assert_eq!(candidate.source_count, limit);
+        SOURCE_PACKING_BUILDS.with(|builds| builds.borrow_mut().clear());
+        SOURCE_PACKING_RECEIPTS.with(|receipts| receipts.set(0));
+        let mut returned = spool_model_batches_for_review(
+            &mut prepared,
+            32_768,
+            32_768,
+            1024,
+            false,
+            limit,
+            false,
+        )
+        .unwrap();
+        assert_eq!(SOURCE_PACKING_RECEIPTS.with(|receipts| receipts.get()), 0);
+        assert_eq!(
+            SOURCE_PACKING_BUILDS.with(|builds| builds.borrow().len()),
+            1
+        );
+        let receipt = returned.deterministic_bounded_receipt(limit).unwrap();
+        assert_eq!(SOURCE_PACKING_RECEIPTS.with(|receipts| receipts.get()), 1);
+        returned.validate_coverage_receipt(&receipt).unwrap();
+        assert!(
+            returned
+                .hunk_risk
+                .iter()
+                .filter(|(_, risk)| risk.mandatory)
+                .all(
+                    |(hunk, _)| receipt.entries.iter().any(|entry| &entry.hunk == hunk
+                        && matches!(entry.disposition, HunkDisposition::Direct { .. }))
+                )
+        );
+        assert_same_model_spool(&mut returned, &mut candidate, limit);
+    }
+
+    #[test]
+    fn source_packing_guard_mult_window_fragments_and_provider_boundary() {
+        let mut source = String::from(
+            "diff --git a/src/auth/large.rs b/src/auth/large.rs\n--- a/src/auth/large.rs\n+++ b/src/auth/large.rs\n@@ -0,0 +1,2400 @@\n",
+        );
+        for _ in 0..2400 {
+            source.push_str(&format!("+{}\n", "x".repeat(900)));
+        }
+        source.push_str(
+            "diff --git a/logo.bin b/logo.bin\nBinary files a/logo.bin and b/logo.bin differ\n",
+        );
+        let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+        let mut prepared = prepare_review(&snapshot).unwrap();
+        let mut windows = 0;
+        while prepared.next_window().unwrap().is_some() {
+            windows += 1;
+        }
+        assert!(windows > 1);
+        for budget in [4096, 32_768] {
+            let mut baseline =
+                spool_model_batches_next_fit(&mut prepared, budget, 4096, 1024, false, 5).unwrap();
+            let expected = mandatory_direct(&mut baseline, 5);
+            let mut guarded = spool_model_batches_with_synthesis_budget(
+                &mut prepared,
+                budget,
+                4096,
+                1024,
+                false,
+                5,
+            )
+            .unwrap();
+            assert!(expected.is_subset(&mandatory_direct(&mut guarded, 5)));
+            assert_same_model_spool(&mut guarded, &mut baseline, 5);
+        }
+        // Explicit provider-bounded selection retains baseline inventory, even
+        // when deterministic selection at 24 would cover every mandatory hunk.
+        let source = capacity_coverage_fixture(32_768, 3);
+        let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+        let mut prepared = prepare_review(&snapshot).unwrap();
+        SOURCE_PACKING_RECEIPTS.with(|receipts| receipts.set(0));
+        let mut provider =
+            spool_model_batches_for_review(&mut prepared, 32_768, 32_768, 1024, false, 24, true)
+                .unwrap();
+        assert_eq!(SOURCE_PACKING_RECEIPTS.with(|receipts| receipts.get()), 0);
+        let mut baseline =
+            spool_model_batches_next_fit(&mut prepared, 32_768, 32_768, 1024, false, 24).unwrap();
+        assert_same_model_spool(&mut provider, &mut baseline, 24);
+        let candidates = provider.hosted_candidates(5, 96).unwrap();
+        assert!(candidates.mandatory_ids.len() <= 5);
+        assert!(
+            candidates
+                .candidate_ids
+                .iter()
+                .all(|id| *id > 0 && *id <= provider.count)
+        );
+        let source = source.replace("/auth/", "/logic/");
+        let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+        let mut prepared = prepare_review(&snapshot).unwrap();
+        let mut no_mandatory =
+            spool_model_batches_with_synthesis_budget(&mut prepared, 32_768, 4096, 1024, false, 1)
+                .unwrap();
+        assert!(no_mandatory.hunk_risk.values().all(|r| !r.mandatory));
+        let mut baseline =
+            spool_model_batches_next_fit(&mut prepared, 32_768, 4096, 1024, false, 1).unwrap();
+        assert_same_model_spool(&mut no_mandatory, &mut baseline, 1);
+    }
+
+    #[test]
+    fn source_packing_guard_small_empty_metadata_and_errors() {
+        for source in [
+            "",
+            "diff --git a/logo.bin b/logo.bin\nBinary files a/logo.bin and b/logo.bin differ\n",
+            "diff --git a/src/auth/a.rs b/src/auth/a.rs\n--- a/src/auth/a.rs\n+++ b/src/auth/a.rs\n@@ -0,0 +1 @@\n+require_admin();\n",
+        ] {
+            for force in [false, true] {
+                let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+                let mut prepared = prepare_review(&snapshot).unwrap();
+                let mut guarded = spool_model_batches_with_synthesis_budget(
+                    &mut prepared,
+                    4096,
+                    4096,
+                    1024,
+                    force,
+                    24,
+                )
+                .unwrap();
+                assert!(guarded.count <= 24);
+                for hunk in &guarded.all_hunks {
+                    assert!(
+                        guarded
+                            .batch_hunks
+                            .iter()
+                            .any(
+                                |(id, hs)| !guarded.synthesis_ids.contains(id) && hs.contains(hunk)
+                            )
+                    );
+                }
+                let receipt = guarded.deterministic_bounded_receipt(24).unwrap();
+                assert_eq!(receipt.direct_hunks(), guarded.all_hunks.len());
+                let mut baseline =
+                    spool_model_batches_next_fit(&mut prepared, 4096, 4096, 1024, force, 24)
+                        .unwrap();
+                assert_same_model_spool(&mut guarded, &mut baseline, 24);
+            }
+        }
+        let source = capacity_coverage_fixture(32_768, 22);
+        let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+        let mut prepared = prepare_review(&snapshot).unwrap();
+        let quota = prepared._window_lease.budget.clone();
+        let preparation = quota.retained_bytes();
+        let candidate =
+            spool_model_batches_with_packing(&mut prepared, 32_768, 32_768, 1024, false, 23, true)
+                .unwrap();
+        let candidate_bytes = candidate._lease.bytes;
+        drop(candidate);
+        // C fits, but B's extra source batch and semantic inventory do not.
+        prepared._window_lease.budget.limit = preparation + candidate_bytes;
+        let error = spool_model_batches_with_synthesis_budget(
+            &mut prepared,
+            32_768,
+            32_768,
+            1024,
+            false,
+            23,
+        )
+        .err()
+        .unwrap();
+        assert!(
+            format!("{error:#}").contains("operation quota"),
+            "{error:#}"
+        );
+        assert_eq!(quota.retained_bytes(), preparation);
+        prepared._window_lease.budget.limit = MAX_REVIEW_SPOOL_BYTES;
+        let mut invalid =
+            spool_model_batches_with_packing(&mut prepared, 32_768, 32_768, 1024, false, 23, true)
+                .unwrap();
+        let hunk = invalid.all_hunks.first().unwrap().clone();
+        invalid.hunk_risk.remove(&hunk);
+        assert!(invalid.deterministic_bounded_receipt(23).is_err());
+        drop(invalid);
+        assert_eq!(quota.retained_bytes(), preparation);
+        // A truncated model file is an error, never interpreted as capacity loss.
+        let mut truncated =
+            spool_model_batches_with_packing(&mut prepared, 32_768, 32_768, 1024, false, 23, true)
+                .unwrap();
+        truncated.file.set_len(1).unwrap();
+        assert!(truncated.deterministic_bounded_receipt(23).is_err());
+        drop(truncated);
+        assert_eq!(quota.retained_bytes(), preparation);
+        assert!(
+            spool_model_batches_with_synthesis_budget(
+                &mut prepared,
+                32_768,
+                32_768,
+                1024,
+                false,
+                0
+            )
+            .is_err()
+        );
+        assert_eq!(quota.retained_bytes(), preparation);
+        prepared.windows.seek(SeekFrom::Start(0)).unwrap();
+        prepared.windows.write_all(&4096u64.to_le_bytes()).unwrap();
+        prepared.windows.set_len(9).unwrap();
+        assert!(
+            spool_model_batches_with_synthesis_budget(
+                &mut prepared,
+                32_768,
+                32_768,
+                1024,
+                false,
+                23
+            )
+            .is_err()
+        );
+        assert_eq!(quota.retained_bytes(), preparation);
+        #[cfg(unix)]
+        {
+            let (stream, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            let descriptor: std::os::fd::OwnedFd = stream.into();
+            prepared.windows = File::from(descriptor);
+            let error = spool_model_batches_with_synthesis_budget(
+                &mut prepared,
+                32_768,
+                32_768,
+                1024,
+                false,
+                23,
+            )
+            .err()
+            .unwrap();
+            assert!(format!("{error:#}").contains("rewinding review windows"));
+            assert_eq!(quota.retained_bytes(), preparation);
+        }
+    }
 
     const SAMPLE: &str = "\
 diff --git a/src/lib.rs b/src/lib.rs
@@ -7276,6 +8003,528 @@ diff --git a/src/multi.rs b/src/multi.rs
                 .iter()
                 .all(|batch| json_string_content_bytes(batch) <= MIN_REVIEW_BATCH_BYTES)
         );
+    }
+
+    fn packing_units(batch: &str) -> Vec<String> {
+        batch
+            .split_inclusive('\n')
+            .fold(Vec::<String>::new(), |mut units, line| {
+                if line.starts_with("### ") {
+                    units.push(String::new());
+                }
+                if let Some(unit) = units.last_mut() {
+                    unit.push_str(line);
+                }
+                units
+            })
+    }
+
+    fn reference_append_unit(
+        plan: &mut ReviewBatchPlan,
+        current: &mut String,
+        hunks: &mut BTreeSet<HunkIdentity>,
+        initial: &str,
+        evidence: (&str, &HunkIdentity),
+        budget: usize,
+    ) -> bool {
+        let (unit, hunk) = evidence;
+        let size = |text: &str| serde_json::to_vec(text).unwrap().len() - 2;
+        if size(initial) + size(unit) > budget {
+            return false;
+        }
+        if current.is_empty() {
+            current.push_str(initial);
+        }
+        if size(current) + size(unit) > budget {
+            if let Some(index) = plan
+                .batches
+                .iter()
+                .position(|batch| size(batch) + size(unit) <= budget)
+            {
+                plan.batches[index].push_str(unit);
+                plan.batch_hunks[index].insert(hunk.clone());
+                return true;
+            }
+            plan.batches.push(std::mem::take(current));
+            plan.batch_hunks.push(std::mem::take(hunks));
+            current.push_str(initial);
+        }
+        current.push_str(unit);
+        hunks.insert(hunk.clone());
+        true
+    }
+
+    #[test]
+    fn source_packing_generated_transitions_match_serialized_reference() {
+        let parsed = parse(
+            "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old\n+first\n@@ -1 +1 @@\n-old\n+second\ndiff --git a/src/b.rs b/src/b.rs\n--- a/src/b.rs\n+++ b/src/b.rs\n@@ -1 +1 @@\n-old\n+third\n",
+        );
+        let identities = parsed
+            .files
+            .iter()
+            .flat_map(|file| {
+                file.hunks
+                    .iter()
+                    .map(|hunk| HunkIdentity::new(&file.path, hunk))
+            })
+            .collect::<Vec<_>>();
+        assert_ne!(identities[0], identities[1]);
+        let manifest = "Changed-file manifest:\n- \"src/quote\\\"界.rs\" [source]\n";
+        for budget in [4_096, 32_768] {
+            for seed in 1..=12u64 {
+                let mut state = seed;
+                let mut plan = ReviewBatchPlan::default();
+                let mut packing = SourceBatchPacking::new(manifest);
+                let mut reference = ReviewBatchPlan::default();
+                let mut current = String::new();
+                let mut hunks = BTreeSet::new();
+                let mut expected = Vec::<String>::new();
+                let mut owners = BTreeMap::<String, HunkIdentity>::new();
+                let mut next_fit = vec![packing.initial_bytes];
+                for index in 0..48 {
+                    state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    let owner = &identities[(state as usize) % identities.len()];
+                    let heading = format!(
+                        "### {}\n@@ generated {index} @@\n     1 + ",
+                        display_path(&owner.path)
+                    );
+                    let pattern = ["界", "\0", "\\", "\"", "\t", "é"][(state as usize / 3) % 6];
+                    let desired = (state as usize / 7) % (budget + 80);
+                    let mut unit = format!(
+                        "{heading}{}\n",
+                        pattern.repeat(desired / json_string_content_bytes(pattern))
+                    );
+                    if index % 13 == 0 && !expected.is_empty() {
+                        unit = expected[0].clone();
+                    }
+                    let owner = owners.get(&unit).cloned().unwrap_or_else(|| owner.clone());
+                    let accepted = append_unit(&mut plan, &mut packing, &unit, &owner, budget);
+                    assert_eq!(
+                        accepted,
+                        reference_append_unit(
+                            &mut reference,
+                            &mut current,
+                            &mut hunks,
+                            &packing.initial,
+                            (&unit, &owner),
+                            budget
+                        )
+                    );
+                    if accepted {
+                        let size = serde_json::to_vec(&unit).unwrap().len() - 2;
+                        if *next_fit.last().unwrap() + size > budget {
+                            next_fit.push(packing.initial_bytes);
+                        }
+                        *next_fit.last_mut().unwrap() += size;
+                        owners.insert(unit.clone(), owner.clone());
+                        expected.push(unit);
+                    }
+                    assert_eq!(plan.batches, reference.batches);
+                    assert_eq!(plan.batch_hunks, reference.batch_hunks);
+                    assert_eq!(packing.current, current);
+                    assert_eq!(packing.current_hunks, hunks);
+                    assert_eq!(packing.closed_bytes.len(), plan.batches.len());
+                    assert_eq!(
+                        packing.current_bytes,
+                        serde_json::to_vec(&packing.current).unwrap().len() - 2
+                    );
+                    assert_eq!(plan.batches.len(), plan.batch_hunks.len());
+                    for (batch, cached) in plan.batches.iter().zip(&packing.closed_bytes) {
+                        assert_eq!(*cached, serde_json::to_vec(batch).unwrap().len() - 2);
+                        assert!(*cached <= budget);
+                        assert!(batch.starts_with(&packing.initial));
+                    }
+                    let mut actual = Vec::new();
+                    for (batch, credited) in plan
+                        .batches
+                        .iter()
+                        .zip(&plan.batch_hunks)
+                        .chain(std::iter::once((&packing.current, &packing.current_hunks)))
+                    {
+                        let units = packing_units(batch);
+                        assert_eq!(
+                            *credited,
+                            units.iter().map(|unit| owners[unit].clone()).collect()
+                        );
+                        actual.extend(units);
+                    }
+                    let mut sorted_expected = expected.clone();
+                    sorted_expected.sort();
+                    actual.sort();
+                    assert_eq!(actual, sorted_expected);
+                    assert!(
+                        plan.batches.len() + usize::from(!packing.current.is_empty())
+                            <= next_fit.len()
+                    );
+                }
+                // Rejection does not flush or mutate the returned source plan.
+                let before = (
+                    plan.batches.clone(),
+                    plan.batch_hunks.clone(),
+                    packing.current.clone(),
+                    packing.current_bytes,
+                    packing.closed_bytes.clone(),
+                );
+                assert!(!append_unit(
+                    &mut plan,
+                    &mut packing,
+                    &"x".repeat(budget),
+                    &identities[0],
+                    budget
+                ));
+                assert_eq!(
+                    before,
+                    (
+                        plan.batches,
+                        plan.batch_hunks,
+                        packing.current,
+                        packing.current_bytes,
+                        packing.closed_bytes
+                    )
+                );
+            }
+            let mut plan = ReviewBatchPlan::default();
+            let mut packing = SourceBatchPacking::new(manifest);
+            let available = budget - packing.initial_bytes;
+            let mut unit = "\0\"\\界".repeat(available / 13);
+            unit.push_str(&"x".repeat(available - (serde_json::to_vec(&unit).unwrap().len() - 2)));
+            assert!(append_unit(
+                &mut plan,
+                &mut packing,
+                &unit,
+                &identities[0],
+                budget
+            ));
+            assert_eq!(packing.current_bytes, budget);
+            assert_eq!(
+                serde_json::to_vec(&packing.current).unwrap().len() - 2,
+                budget
+            );
+        }
+    }
+
+    #[test]
+    fn source_packing_reuses_capacity_without_changing_units_or_ownership() {
+        let mut source = String::new();
+        for (path, lines, marker) in [
+            ("src/a.rs", 20, 'a'),
+            ("src/b.rs", 25, 'b'),
+            ("src/a.rs", 10, 'c'),
+        ] {
+            source.push_str(&format!(
+                "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -0,0 +1,{lines} @@\n"
+            ));
+            for _ in 0..lines {
+                source.push_str(&format!("+{}\n", marker.to_string().repeat(990)));
+            }
+        }
+        source.push_str("diff --git a/logo.bin b/logo.bin\nold mode 100644\nnew mode 100755\nBinary files a/logo.bin and b/logo.bin differ\n");
+        let parsed = parse(&source);
+        let manifest = build_manifest(&parsed, &[], &[], 4096);
+        let plan = render_review_batches(&parsed, &[], &[], 32_768, 4096);
+        let again = render_review_batches(&parsed, &[], &[], 32_768, 4096);
+        assert!(!plan.incomplete);
+        assert_eq!(plan.batches.len(), 2);
+        assert_eq!(plan.batches, again.batches);
+        assert_eq!(plan.batch_hunks, again.batch_hunks);
+        let mut expected = Vec::new();
+        let mut owners = BTreeMap::new();
+        let mut next_fit_sizes = vec![json_string_content_bytes(&format!("{}\n", manifest.text))];
+        for file in &parsed.files {
+            for hunk in &file.hunks {
+                for unit in render_hunk_units(
+                    file,
+                    hunk,
+                    32_768 - json_string_content_bytes(&manifest.text) - 2,
+                )
+                .unwrap()
+                {
+                    let size = json_string_content_bytes(&unit);
+                    if *next_fit_sizes.last().unwrap() + size > 32_768 {
+                        next_fit_sizes
+                            .push(json_string_content_bytes(&format!("{}\n", manifest.text)));
+                    }
+                    *next_fit_sizes.last_mut().unwrap() += size;
+                    owners.insert(unit.clone(), HunkIdentity::new(&file.path, hunk));
+                    expected.push(unit);
+                }
+            }
+        }
+        assert_eq!(next_fit_sizes.len(), 3);
+        let mut actual = Vec::new();
+        for (batch, hunks) in plan.batches.iter().zip(&plan.batch_hunks) {
+            assert!(batch.starts_with(&format!("{}\n", manifest.text)));
+            assert!(batch.contains("mode 100644 -> 100755"));
+            let units = packing_units(batch.strip_prefix(&format!("{}\n", manifest.text)).unwrap());
+            assert_eq!(
+                *hunks,
+                units.iter().map(|unit| owners[unit].clone()).collect()
+            );
+            actual.extend(units);
+        }
+        actual.sort();
+        expected.sort();
+        assert_eq!(actual, expected);
+        assert_eq!(plan.batch_hunks[0].len(), 2);
+        assert_eq!(plan.batch_hunks[1].len(), 1);
+        assert!(review_batch_contains_exact_evidence(
+            &plan.batches[0],
+            "src/a.rs",
+            1,
+            Some(&"c".repeat(990))
+        ));
+        assert!(!review_batch_contains_exact_evidence(
+            &plan.batches[0],
+            "src/b.rs",
+            1,
+            Some(&"c".repeat(990))
+        ));
+    }
+
+    #[test]
+    fn source_packing_reordered_segments_preserve_grounding_and_mandatory_fragments() {
+        let path = "src/auth/quote\"界.rs";
+        let header = format!("### {}\n", display_path(path));
+        let parsed = parse(
+            "diff --git a/src/auth/a.rs b/src/auth/a.rs\n--- a/src/auth/a.rs\n+++ b/src/auth/a.rs\n@@ -1 +1 @@\n-old\n+require_admin();\n",
+        );
+        let identity = HunkIdentity::new(path, &parsed.files[0].hunks[0]);
+        let mut plan = ReviewBatchPlan::default();
+        let mut packing = SourceBatchPacking::new("manifest");
+        let units = [
+            format!(
+                "{header}@@ segment one @@\n     1 + {}\n",
+                "a".repeat(2_300)
+            ),
+            format!(
+                "{header}@@ segment two @@\n    20 + {}\n",
+                "b".repeat(3_100)
+            ),
+            format!(
+                "{header}@@ segment three @@\n    30 + load_order_for_update(id);\n    31 + {}\n",
+                "c".repeat(1000)
+            ),
+        ];
+        for unit in &units {
+            assert!(append_unit(&mut plan, &mut packing, unit, &identity, 4096));
+        }
+        plan.batches.push(packing.current);
+        plan.batch_hunks.push(packing.current_hunks);
+        assert_eq!(plan.batches.len(), 2);
+        assert!(plan.batches[0].contains(&units[2]));
+        let decorated = format!(
+            "Synthetic title and feedback\n{}\nRetry instructions",
+            plan.batches[0]
+        );
+        assert!(!review_batch_contains_range(&decorated, path, 1, 30));
+        assert!(review_batch_contains_exact_evidence(
+            &decorated,
+            path,
+            30,
+            Some("load_order_for_update(id);")
+        ));
+        assert!(!review_batch_contains_exact_evidence(
+            &decorated,
+            "src/other.rs",
+            30,
+            Some("load_order_for_update(id);")
+        ));
+        let local = render_review_batch_context(&decorated, path, 30, 2, 1024).unwrap();
+        assert!(local.contains("load_order_for_update"));
+        let related = render_related_scorer_evidence(
+            &plan.batches,
+            path,
+            "Verify load_order_for_update",
+            1024,
+        )
+        .unwrap();
+        assert!(related.len() <= 1024);
+        assert!(related.contains(&display_path(path)));
+
+        let long_line = format!("{}TAIL", "界".repeat(4_000));
+        let mut source = String::from(
+            "diff --git a/src/auth/a.rs b/src/auth/a.rs\n--- a/src/auth/a.rs\n+++ b/src/auth/a.rs\n@@ -1 +1,61 @@\n-old\n",
+        );
+        source.push_str(&format!("+{long_line}\n"));
+        for _ in 0..60 {
+            source.push_str(&format!("+require_admin({});\n", "x".repeat(80)));
+        }
+        let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+        let mut prepared = prepare_review(&snapshot).unwrap();
+        let mut batches = spool_model_batches(&mut prepared, 4096, 1024, false).unwrap();
+        let hunk = batches.hunk_risk.keys().next().unwrap().clone();
+        assert!(batches.hunk_risk[&hunk].mandatory);
+        let required = batches
+            .batch_hunks
+            .iter()
+            .filter(|(id, hs)| !batches.synthesis_ids.contains(id) && hs.contains(&hunk))
+            .map(|(id, _)| *id)
+            .collect::<BTreeSet<_>>();
+        assert!(required.len() > 1);
+        let partial = batches.deterministic_bounded_receipt(1).unwrap();
+        assert_eq!(partial.direct_hunks(), 0);
+        assert_eq!(partial.unreviewed_hunks(), 1);
+        let complete = batches
+            .deterministic_bounded_receipt(batches.count)
+            .unwrap();
+        assert_eq!(complete.direct_hunks(), 1);
+        assert_eq!(complete.unreviewed_hunks(), 0);
+        assert!(required.is_subset(&complete.selected_batch_ids));
+        assert!(
+            matches!(&complete.entries[0].disposition, HunkDisposition::Direct { batch_ids } if batch_ids.iter().copied().collect::<BTreeSet<_>>() == required)
+        );
+        for limit in 1..required.len() {
+            let receipt = batches.deterministic_bounded_receipt(limit).unwrap();
+            assert_eq!(receipt.direct_hunks(), 0);
+            assert_eq!(receipt.unreviewed_hunks(), 1);
+        }
+        let mut repeated_prepared = prepare_review(&snapshot).unwrap();
+        let mut repeated = spool_model_batches(&mut repeated_prepared, 4096, 1024, false).unwrap();
+        let repeated_receipt = repeated
+            .deterministic_bounded_receipt(repeated.count)
+            .unwrap();
+        assert_eq!(complete.plan_sha256, repeated_receipt.plan_sha256);
+        assert_eq!(complete.entries, repeated_receipt.entries);
+        let mut wider_prepared = prepare_review(&snapshot).unwrap();
+        let wider = spool_model_batches(&mut wider_prepared, 32768, 1024, false).unwrap();
+        assert_eq!(
+            batches.hunk_risk.keys().collect::<BTreeSet<_>>(),
+            wider.hunk_risk.keys().collect()
+        );
+        for (hunk, risk) in &batches.hunk_risk {
+            let other = &wider.hunk_risk[hunk];
+            assert_eq!(
+                (risk.mandatory, risk.semantic_eligible, risk.score),
+                (other.mandatory, other.semantic_eligible, other.score)
+            );
+        }
+        batches.validate_coverage_receipt(&complete).unwrap();
+        let texts = batches.batch_text_by_id(&required).unwrap();
+        let mut coverage = vec![false; long_line.len()];
+        for batch in texts.values() {
+            let mut slice = None;
+            for line in batch.lines() {
+                if let Some(range) = line
+                    .strip_prefix("@@slice ")
+                    .and_then(|r| r.strip_suffix("@@"))
+                {
+                    slice = range
+                        .split_once("..")
+                        .map(|(a, b)| (a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap()));
+                } else if let Some((start, end)) = slice.take() {
+                    let payload = line.trim_start().split_once(" + ").unwrap().1;
+                    assert_eq!(payload, &long_line[start..end]);
+                    coverage[start..end].fill(true);
+                    assert!(review_batch_contains_exact_evidence(
+                        batch,
+                        "src/auth/a.rs",
+                        1,
+                        Some(payload)
+                    ));
+                }
+            }
+        }
+        assert!(coverage.into_iter().all(|covered| covered));
+    }
+
+    #[test]
+    #[ignore = "native scaling comparison"]
+    fn source_packing_near_window_failed_fits_match_reference() {
+        for budget in [4_096, 32_768] {
+            let mut source = String::from(
+                "diff --git a/src/many.rs b/src/many.rs\n--- a/src/many.rs\n+++ b/src/many.rs\n",
+            );
+            let lines = budget / 1_800 + 1;
+            let mut index = 0;
+            while source.len() < 1_900_000 {
+                source.push_str(&format!("@@ -0,0 +{},{lines} @@\n", 1 + index * lines));
+                index += 1;
+                for _ in 0..lines {
+                    source.push_str(&format!("+{}\n", "x".repeat(900)));
+                }
+            }
+            assert!(source.len() < STREAM_WINDOW_BYTES);
+            let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+            let mut prepared = prepare_review(&snapshot).unwrap();
+            let window = prepared.next_window().unwrap().unwrap();
+            assert!(window.len() < STREAM_WINDOW_BYTES);
+            assert!(prepared.next_window().unwrap().is_none());
+            let diff = parse(&window);
+            assert!(diff.complete);
+            // Use a bounded common prefix to isolate fit-search work from manifest construction.
+            let manifest = "Changed-file manifest:\n";
+            let mut packing = SourceBatchPacking::new(manifest);
+            let mut plan = ReviewBatchPlan::default();
+            let units = diff
+                .files
+                .iter()
+                .flat_map(|file| {
+                    file.hunks.iter().flat_map(|hunk| {
+                        render_hunk_units(file, hunk, budget - packing.initial_bytes)
+                            .unwrap()
+                            .into_iter()
+                            .map(|unit| (unit, HunkIdentity::new(&file.path, hunk)))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>();
+            let started = std::time::Instant::now();
+            for (unit, hunk) in &units {
+                assert!(append_unit(&mut plan, &mut packing, unit, hunk, budget));
+            }
+            let cached_elapsed = started.elapsed();
+            let failed_fit_checks = (plan.batches.len() * plan.batches.len().saturating_sub(1)) / 2;
+            assert!(failed_fit_checks > 1_000);
+            let mut reference = ReviewBatchPlan::default();
+            let mut current = String::new();
+            let mut hunks = BTreeSet::new();
+            let started = std::time::Instant::now();
+            for (unit, hunk) in &units {
+                assert!(reference_append_unit(
+                    &mut reference,
+                    &mut current,
+                    &mut hunks,
+                    &packing.initial,
+                    (unit, hunk),
+                    budget
+                ));
+            }
+            let reference_elapsed = started.elapsed();
+            let started = std::time::Instant::now();
+            let mut next_fit = Vec::new();
+            let mut next_current = String::new();
+            for (unit, _) in &units {
+                if next_current.is_empty() {
+                    next_current.push_str(&packing.initial);
+                }
+                if json_string_content_bytes(&next_current) + json_string_content_bytes(unit)
+                    > budget
+                {
+                    next_fit.push(std::mem::take(&mut next_current));
+                    next_current.push_str(&packing.initial);
+                }
+                next_current.push_str(unit);
+            }
+            let next_fit_elapsed = started.elapsed();
+            assert_eq!(next_fit, plan.batches);
+            assert_eq!(next_current, packing.current);
+            assert_eq!(plan.batches, reference.batches);
+            assert_eq!(plan.batch_hunks, reference.batch_hunks);
+            assert_eq!(packing.current, current);
+            assert_eq!(packing.current_hunks, hunks);
+            for (batch, size) in plan.batches.iter().zip(&packing.closed_bytes) {
+                assert_eq!(*size, serde_json::to_vec(batch).unwrap().len() - 2);
+            }
+            eprintln!(
+                "source_budget={budget} normalized_bytes={} units={} closed_batches={} failed_fit_checks={failed_fit_checks} cached_us={} serialized_reference_us={} next_fit_us={}",
+                window.len(),
+                units.len(),
+                plan.batches.len(),
+                cached_elapsed.as_micros(),
+                reference_elapsed.as_micros(),
+                next_fit_elapsed.as_micros()
+            );
+        }
     }
 
     #[test]

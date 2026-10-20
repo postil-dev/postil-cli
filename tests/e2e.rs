@@ -195,20 +195,66 @@ impl Respond for AllUnresolvedAdjudicator {
     }
 }
 
+const ADJUDICATION_CORRECTION_SUFFIX: &str = "\n\nReturn the complete adjudication JSON array for the original candidate IDs. Correct the rejected output using only the supplied evidence. A refutation needs candidate-specific contradictory evidence, not its own citation or unsupported prose. A context-anchored confirmation needs an exact causal change reference. Preserve all structural, scope and publication rules. Never invent evidence or references, silently drop a candidate, or fabricate a verdict.";
+
+fn adjudication_payload(request: &Value) -> Value {
+    let text = request["messages"].as_array().unwrap().last().unwrap()["content"]
+        .as_str()
+        .unwrap();
+    let mut stream = serde_json::Deserializer::from_str(text).into_iter::<Value>();
+    let payload = stream.next().unwrap().unwrap();
+    let suffix = &text[stream.byte_offset()..];
+    assert!(suffix.is_empty() || suffix == ADJUDICATION_CORRECTION_SUFFIX);
+    payload
+}
+
+fn assert_adjudication_calls(requests: &[Request], phases: &[&str], envelope: &Value) {
+    let adjudicators = requests
+        .iter()
+        .filter(|request| request_system_contains(request, "single finding adjudicator"))
+        .collect::<Vec<_>>();
+    assert_eq!(adjudicators.len(), phases.len());
+    let initial: Value = adjudicators[0].body_json().unwrap();
+    adjudication_payload(&initial);
+    for (index, request) in adjudicators.iter().enumerate() {
+        let actual: Value = request.body_json().unwrap();
+        let mut expected = initial.clone();
+        if index > 0 {
+            let content = expected["messages"]
+                .as_array_mut()
+                .unwrap()
+                .last_mut()
+                .unwrap();
+            content["content"] = json!(format!(
+                "{}{}",
+                content["content"].as_str().unwrap(),
+                ADJUDICATION_CORRECTION_SUFFIX
+            ));
+        }
+        assert_eq!(actual, expected);
+    }
+    // All calls in these fixtures return known usage; one source precedes adjudication.
+    assert_eq!(envelope["usageAccountingComplete"], true);
+    assert_model_usage_matches_aggregate(envelope);
+    let events = envelope["modelUsage"].as_array().unwrap();
+    assert_eq!(events.len(), requests.len());
+    for (index, phase) in phases.iter().enumerate() {
+        assert_eq!(events[index + 1]["role"], "findingScorer");
+        assert_eq!(events[index + 1]["phase"], *phase);
+        assert_eq!(events[index + 1]["accountingComplete"], true);
+        assert_eq!(events[index + 1]["promptTokens"], 30);
+        assert_eq!(events[index + 1]["completionTokens"], 10);
+        assert_eq!(events[index + 1]["costMicros"], 45);
+    }
+}
+
 #[derive(Clone, Copy)]
 struct AllRefutedAdjudicator;
 
 impl Respond for AllRefutedAdjudicator {
     fn respond(&self, request: &Request) -> ResponseTemplate {
         let request_body: Value = request.body_json().unwrap();
-        let payload: Value = serde_json::from_str(
-            request_body["messages"]
-                .as_array()
-                .and_then(|messages| messages.last())
-                .and_then(|message| message["content"].as_str())
-                .unwrap(),
-        )
-        .unwrap();
+        let payload = adjudication_payload(&request_body);
         let results = payload["candidates"]
             .as_array()
             .unwrap()
@@ -3779,12 +3825,7 @@ async fn ungrounded_refutation_keeps_candidates_for_the_existing_scorer() {
             .and(body_string_contains("single finding adjudicator"))
             .respond_with(move |request: &Request| {
                 let request: Value = request.body_json().unwrap();
-                let payload: Value = serde_json::from_str(
-                    request["messages"].as_array().unwrap().last().unwrap()["content"]
-                        .as_str()
-                        .unwrap(),
-                )
-                .unwrap();
+                let payload = adjudication_payload(&request);
                 let candidate = &payload["candidates"][0];
                 ResponseTemplate::new(200).set_body_json(scorer_text(
                     &json!([{
@@ -3796,7 +3837,7 @@ async fn ungrounded_refutation_keeps_candidates_for_the_existing_scorer() {
                 ))
             })
             .with_priority(1)
-            .expect(1)
+            .expect(if scorer_disabled { 2 } else { 1 })
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -3842,6 +3883,15 @@ async fn ungrounded_refutation_keeps_candidates_for_the_existing_scorer() {
             "{label}: {stderr}"
         );
         let requests = server.received_requests().await.unwrap();
+        assert_adjudication_calls(
+            &requests,
+            if scorer_disabled {
+                &["initial", "semanticRetry"]
+            } else {
+                &["initial"]
+            },
+            &envelope,
+        );
         let scorers = requests
             .iter()
             .filter(|request| request_system_contains(request, "independent second-model scorer"))
@@ -4191,6 +4241,7 @@ async fn malformed_adjudication_output_blocks_under_advisory_provider_policy() {
         .and(body_string_contains("single finding adjudicator"))
         .respond_with(ResponseTemplate::new(200).set_body_json(scorer_text("not json")))
         .with_priority(1)
+        .expect(2)
         .mount(&server)
         .await;
     mock_review(
@@ -4226,12 +4277,19 @@ async fn malformed_adjudication_output_blocks_under_advisory_provider_policy() {
         .filter_map(|line| line.strip_prefix("postil: adjudication-output "))
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(records.len(), 2);
-    assert_eq!(records[0]["event"], "callStarted");
-    assert_eq!(records[1]["event"], "parserRejected");
-    assert_eq!(records[1]["code"], "noArray");
-    assert_eq!(records[1]["call"], records[0]["call"]);
-    assert_eq!(records[1]["attempt"], Value::Null);
+    assert_eq!(records.len(), 4);
+    for (call, phase) in [(1, "initial"), (2, "schema-repair")] {
+        let started = &records[(call - 1) * 2];
+        let rejected = &records[(call - 1) * 2 + 1];
+        assert_eq!(started["event"], "callStarted");
+        assert_eq!(rejected["event"], "parserRejected");
+        assert_eq!(rejected["code"], "noArray");
+        for record in [started, rejected] {
+            assert_eq!(record["call"], call);
+            assert_eq!(record["callPhase"], phase);
+            assert_eq!(record["attempt"], Value::Null);
+        }
+    }
     let envelope: Value = serde_json::from_slice(&out.get_output().stdout).unwrap();
 
     assert!(
@@ -4250,6 +4308,21 @@ async fn malformed_adjudication_output_blocks_under_advisory_provider_policy() {
             .unwrap()
             .iter()
             .any(|finding| finding["path"] == ".postil/model-output")
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert_adjudication_calls(&requests, &["initial", "schemaRepair"], &envelope);
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request_system_contains(request, "independent second-model scorer"))
+    );
+    let incidents = envelope["modelIncidents"].as_array().unwrap();
+    assert_eq!(incidents.len(), 2);
+    assert!(
+        incidents
+            .iter()
+            .all(|incident| incident["category"] == "invalidOutput"
+                && incident["recovered"] == false)
     );
     assert_eq!(envelope["counts"]["warn"], 1);
     assert_eq!(envelope["counts"]["error"], 1);
@@ -6922,7 +6995,7 @@ async fn compact_lockfile_platform_claim_survives_failed_adjudication() {
                 .and(body_string_contains("single finding adjudicator"))
                 .respond_with(AllRefutedAdjudicator)
                 .with_priority(1)
-                .expect(1)
+                .expect(2)
                 .mount(&server)
                 .await;
         }
@@ -7000,6 +7073,9 @@ async fn compact_lockfile_platform_claim_survives_failed_adjudication() {
         );
         assert_eq!(envelope["gate"]["failing"], true);
         let requests = server.received_requests().await.unwrap();
+        if refuted {
+            assert_adjudication_calls(&requests, &["initial", "semanticRetry"], &envelope);
+        }
         assert!(
             requests.iter().all(|request| !request_system_contains(
                 request,
@@ -14392,7 +14468,7 @@ async fn fresh_unresolved_repository_claims_are_suppressed() {
                     .and(body_string_contains("single finding adjudicator"))
                     .respond_with(AllRefutedAdjudicator)
                     .with_priority(1)
-                    .expect(1)
+                    .expect(2)
                     .mount(&server)
                     .await;
             }
@@ -14449,6 +14525,15 @@ async fn fresh_unresolved_repository_claims_are_suppressed() {
                 );
             }
             let requests = server.received_requests().await.unwrap();
+            assert_adjudication_calls(
+                &requests,
+                if refuted {
+                    &["initial", "semanticRetry"]
+                } else {
+                    &["initial"]
+                },
+                &envelope,
+            );
             assert!(requests.iter().all(|request| !request_system_contains(
                 request,
                 "independent second-model scorer"
@@ -14806,12 +14891,7 @@ async fn scorer_cannot_suppress_an_unresolved_full_rereview_baseline() {
                 .and(body_string_contains("single finding adjudicator"))
                 .respond_with(move |request: &Request| {
                     let request: Value = request.body_json().unwrap();
-                    let payload: Value = serde_json::from_str(
-                        request["messages"].as_array().unwrap().last().unwrap()["content"]
-                            .as_str()
-                            .unwrap(),
-                    )
-                    .unwrap();
+                    let payload = adjudication_payload(&request);
                     let results = payload["candidates"]
                         .as_array()
                         .unwrap()
@@ -14827,7 +14907,7 @@ async fn scorer_cannot_suppress_an_unresolved_full_rereview_baseline() {
                     ResponseTemplate::new(200).set_body_json(scorer_content(json!(results)))
                 })
                 .with_priority(1)
-                .expect(1)
+                .expect(if status == "refuted" { 2 } else { 1 })
                 .mount(&server)
                 .await;
             let directory = tempfile::tempdir().unwrap();
@@ -14900,6 +14980,15 @@ async fn scorer_cannot_suppress_an_unresolved_full_rereview_baseline() {
             assert_eq!(envelope["usageAccountingComplete"], true);
             assert_model_usage_matches_aggregate(&envelope);
             let requests = server.received_requests().await.unwrap();
+            assert_adjudication_calls(
+                &requests,
+                if status == "refuted" {
+                    &["initial", "semanticRetry"]
+                } else {
+                    &["initial"]
+                },
+                &envelope,
+            );
             assert!(requests.iter().all(|request| {
                 !String::from_utf8_lossy(&request.body).contains("independent second-model scorer")
             }));
@@ -16363,7 +16452,7 @@ async fn causal_scope_contract_prevents_context_relabeling_before_scoring() {
                 let mut response = if request_system_contains(request, "single finding adjudicator") {
                     let body: Value = request.body_json().unwrap();
                     assert!(body["messages"][0]["content"].as_str().unwrap().starts_with("You are Postil's single finding adjudicator. "));
-                    let payload: Value = serde_json::from_str(body["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap()).unwrap();
+                    let payload = adjudication_payload(&body);
                     let result = payload["candidates"].as_array().unwrap().iter().map(|candidate| {
                         let mut result = json!({"candidateId":candidate["candidateId"], "status":"confirmed", "revisedTitle":candidate["title"], "revisedBody":"Untrusted input bypasses the authorization boundary. Restore the guard before dispatch.", "evidence":candidate["citedEvidence"], "duplicateOf":null});
                         if excluded {
@@ -16592,14 +16681,43 @@ async fn causal_scope_contract_prevents_context_relabeling_before_scoring() {
             }
             assert_eq!(envelope["findings"][0]["scorerConfidence"], 0.99, "{mode}");
         }
-        assert!(
-            requests
-                .iter()
-                .filter(|request| request_system_contains(request, "single finding adjudicator"))
-                .count()
-                <= 1,
-            "{mode}"
-        );
+        let phases: &[&str] = if matches!(mode, "missing" | "unresolved" | "demoted") {
+            &["initial", "semanticRetry"]
+        } else {
+            &["initial"]
+        };
+        if mode == "carried-incremental" {
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| !request_system_contains(request, "single finding adjudicator")),
+                "{mode}"
+            );
+        } else if !scope_failure {
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request_system_contains(
+                        request,
+                        "single finding adjudicator"
+                    ))
+                    .count(),
+                phases.len(),
+                "{mode}"
+            );
+            assert_adjudication_calls(&requests, phases, &envelope);
+        } else {
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request_system_contains(
+                        request,
+                        "single finding adjudicator"
+                    ))
+                    .count(),
+                1
+            );
+        }
     }
 }
 

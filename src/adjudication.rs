@@ -14,6 +14,29 @@ pub(crate) const MAX_ADJUDICATION_CANDIDATES: usize = 20;
 pub(crate) const MAX_ADJUDICATION_CORPUS_BYTES: usize = 24 * 1024;
 pub(crate) const MAX_ADJUDICATION_PROMPT_BYTES: usize = 48 * 1024;
 pub(crate) const MAX_ADJUDICATION_OUTPUT_TOKENS: u32 = 8_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdjudicationViolation {
+    UnknownCandidateIdentity,
+    ContradictoryRefutation,
+    MissingCausalReference,
+}
+
+impl std::fmt::Display for AdjudicationViolation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::UnknownCandidateIdentity => "adjudication returned an unknown candidate identity",
+            Self::ContradictoryRefutation => {
+                "refuted adjudication must cite candidate-specific contradictory evidence"
+            }
+            Self::MissingCausalReference => {
+                "context-anchored confirmation requires a causal change reference"
+            }
+        })
+    }
+}
+
+impl std::error::Error for AdjudicationViolation {}
 const MAX_DIRECT_EVIDENCE_QUERIES: usize = 128;
 const MAX_DIRECT_EVIDENCE_QUERY_BYTES: usize = 8 * 1024;
 const MAX_CITED_EVIDENCE_BYTES: usize = 1_024;
@@ -1179,7 +1202,7 @@ fn validate_result_structure(
     for result in results {
         ensure!(
             expected.contains(&result.candidate_id),
-            "adjudication returned an unknown candidate identity"
+            AdjudicationViolation::UnknownCandidateIdentity
         );
         ensure!(
             seen.insert(result.candidate_id.clone()),
@@ -1357,7 +1380,7 @@ pub(crate) fn validate_results(
                 );
                 ensure!(
                     refutation_grounded,
-                    "refuted adjudication must cite candidate-specific contradictory evidence"
+                    AdjudicationViolation::ContradictoryRefutation
                 );
             }
             AdjudicationStatus::Unresolved => ensure!(
@@ -1758,9 +1781,7 @@ fn validate_scopes(
                 evidence: evidence.to_string(),
             })
         } else {
-            return Err(anyhow!(
-                "context-anchored confirmation requires a causal change reference"
-            ));
+            return Err(AdjudicationViolation::MissingCausalReference.into());
         };
         scopes.insert(
             result.candidate_id.clone(),

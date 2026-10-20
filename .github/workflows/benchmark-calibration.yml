@@ -13,7 +13,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Reserve the current main calibration source
+      - name: Verify the current main calibration source
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -31,10 +31,6 @@ jobs:
             echo "::error::Calibration source is not the current main commit."
             exit 1
           }
-          gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
-            -f ref="refs/tags/postil-calibration-${GITHUB_SHA}" \
-            -f sha="${GITHUB_SHA}" \
-            --silent
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
@@ -45,10 +41,76 @@ jobs:
       - name: Verify embedded model admission
         working-directory: bench
         run: bun run verify-admission --allow-provisional
-      - name: Require an unpopulated Azure/US Luna baseline
-        run: >-
-          jq -e '.profiles["openai/gpt-5.6-luna"].populated == false'
-          bench/baseline-us.json >/dev/null
+      - name: Fingerprint the current evaluator contract
+        id: evaluator
+        working-directory: bench
+        run: |
+          bun -e 'import { evaluatorSourceSha256 } from "./src/live"; console.log("sha256=" + await evaluatorSourceSha256())' >> "$GITHUB_OUTPUT"
+      - name: Verify the calibration baseline input
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_EVALUATOR_SHA256: ${{ steps.evaluator.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          profile="openai/gpt-5.6-luna"
+          populated="$(jq -er --arg profile "$profile" '.profiles[$profile].populated | if type == "boolean" then tostring else error("Calibration populated state must be boolean") end' bench/baseline-us.json)"
+          case "$populated" in
+            false) exit 0 ;;
+            true) ;;
+            *) echo "::error::Calibration baseline must declare a boolean populated state."; exit 1 ;;
+          esac
+          test -s bench/baseline-us.attestation.json || {
+            echo "::error::Populated recalibration requires the retained baseline attestation."
+            exit 1
+          }
+          source_sha="$(jq -er --arg profile "$profile" '.profiles[$profile].calibration.sourceSha' bench/baseline-us.json)"
+          [[ "$source_sha" =~ ^[0-9a-f]{40,64}$ ]] || {
+            echo "::error::Prior calibration source digest is invalid."
+            exit 1
+          }
+          test "$source_sha" != "$GITHUB_SHA" || {
+            echo "::error::Recalibration requires a new main source commit."
+            exit 1
+          }
+          prior_evaluator="$(jq -er '.corpus.evaluatorSha256' bench/baseline-us.json)"
+          [[ "$prior_evaluator" =~ ^[0-9a-f]{64}$ && "$CURRENT_EVALUATOR_SHA256" =~ ^[0-9a-f]{64}$ ]] || {
+            echo "::error::Calibration evaluator digest is invalid."
+            exit 1
+          }
+          test "$prior_evaluator" != "$CURRENT_EVALUATOR_SHA256" || {
+            echo "::error::Populated recalibration requires a changed evaluator contract."
+            exit 1
+          }
+          registry_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/postil-calibration-${source_sha}" --jq .object.sha)"
+          test "$registry_sha" = "$source_sha" || {
+            echo "::error::Prior calibration registry source mismatch."
+            exit 1
+          }
+          gh attestation verify bench/baseline-us.json \
+            --bundle bench/baseline-us.attestation.json \
+            --repo postil-dev/postil-cli \
+            --signer-workflow postil-dev/postil-cli/.github/workflows/benchmark-calibration.yml \
+            --signer-digest "$source_sha" \
+            --source-digest "$source_sha" \
+            --source-ref refs/heads/main \
+            --cert-oidc-issuer https://token.actions.githubusercontent.com \
+            --predicate-type https://slsa.dev/provenance/v1 \
+            --deny-self-hosted-runners \
+            --format json >/dev/null
+      - name: Reserve the current main calibration source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          main_sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)"
+          test "${GITHUB_SHA}" = "$main_sha" || {
+            echo "::error::Calibration source is no longer the current main commit."
+            exit 1
+          }
+          gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+            -f ref="refs/tags/postil-calibration-${GITHUB_SHA}" \
+            -f sha="${GITHUB_SHA}" \
+            --silent
 
   prepare:
     needs: validate
@@ -149,6 +211,7 @@ jobs:
           name: benchmark-calibration-prepared-${{ github.run_id }}
           path: ${{ runner.temp }}/prepared
       - name: Verify prepared calibration provenance
+        id: verify-prepared
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -173,6 +236,7 @@ jobs:
       - name: Resolve canonical sample slot
         run: echo "CALIBRATION_SLOT=$(printf '%02d' '${{ matrix.sample }}')" >> "$GITHUB_ENV"
       - name: Reserve benchmark sample ${{ matrix.sample }}
+        id: reserve-sample
         working-directory: bench
         run: >-
           bun run bench:cohort-run --
@@ -193,6 +257,7 @@ jobs:
           cp "${RUNNER_TEMP}/prepared/slots/${CALIBRATION_SLOT}/receipt.json" \
             "${RUNNER_TEMP}/reservation.receipt.json"
       - name: Execute benchmark sample ${{ matrix.sample }}
+        id: execute-sample
         working-directory: bench
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
@@ -213,6 +278,7 @@ jobs:
             ${{ runner.temp }}/prepared/slots/${{ env.CALIBRATION_SLOT }}/report.json
             ${{ runner.temp }}/prepared/slots/${{ env.CALIBRATION_SLOT }}/receipt.json
       - name: Stage benchmark sample evidence
+        id: stage-sample
         if: always()
         run: |
           set -euo pipefail
@@ -228,6 +294,7 @@ jobs:
             cp "${{ steps.attest-result.outputs.bundle-path }}" "$evidence/result.attestation.json"
           fi
       - name: Upload benchmark sample evidence
+        id: upload-sample
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -235,6 +302,25 @@ jobs:
           path: ${{ runner.temp }}/benchmark-calibration-sample-${{ env.CALIBRATION_SLOT }}
           if-no-files-found: error
           retention-days: 90
+      - name: Summarize failed calibration sample
+        if: failure()
+        env:
+          SAMPLE: ${{ matrix.sample }}
+          STEP_RESULTS: ${{ toJSON(steps) }}
+          UPLOAD_OUTCOME: ${{ steps.upload-sample.outcome }}
+        run: |
+          {
+            echo "Calibration sample ${SAMPLE} failed; step outcomes:"
+            jq -r 'to_entries[] | "\(.key): \(.value.outcome)"' <<< "$STEP_RESULTS"
+            echo "Run logs (job ${GITHUB_JOB}, attempt ${GITHUB_RUN_ATTEMPT}): ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            if [[ "$UPLOAD_OUTCOME" == "success" ]]; then
+              echo "Uploaded sample evidence: benchmark-calibration-sample-${GITHUB_RUN_ID}-${SAMPLE}."
+            else
+              echo "Sample artifact was not uploaded (upload outcome: ${UPLOAD_OUTCOME:-not run}); use the run/job logs."
+            fi
+            echo "Failed evidence is not a calibration."
+            echo "Fix the source on main and start a new first-attempt run. Do not reuse this reservation or rerun this cohort."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   record:
     needs: [validate, prepare, sample]
