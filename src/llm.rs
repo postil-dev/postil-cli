@@ -18,7 +18,9 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use time::Date;
 
-use crate::adjudication::{AdjudicationResult, MAX_ADJUDICATION_OUTPUT_TOKENS};
+use crate::adjudication::{
+    ADJUDICATION_CORRECTION_SUFFIX, AdjudicationResult, MAX_ADJUDICATION_OUTPUT_TOKENS,
+};
 use crate::api_key;
 
 macro_rules! eprintln {
@@ -6655,8 +6657,6 @@ fn adjudication_count(value: usize) -> serde_json::Value {
     }
 }
 
-const ADJUDICATION_CORRECTION_SUFFIX: &str = "\n\nReturn the complete adjudication JSON array for the original candidate IDs. Correct the rejected output using only the supplied evidence. A refutation needs candidate-specific contradictory evidence, not its own citation or unsupported prose. A context-anchored confirmation needs an exact causal change reference. Preserve all structural, scope and publication rules. Never invent evidence or references, silently drop a candidate, or fabricate a verdict.";
-
 fn adjudication_correction_user(user: &str) -> Result<String> {
     ensure!(
         user.len()
@@ -10194,6 +10194,76 @@ mod tests {
         assert!(!review.usage_accounting_complete);
     }
 
+    #[tokio::test]
+    async fn adjudication_admission_corrects_a_full_production_prompt() {
+        let mut fixture = AdjudicationFixture::new(false, 1);
+        fixture.cfg.model = "z-ai/glm-5.2".into();
+        let original_candidates = serde_json::to_value(&fixture.candidates).unwrap();
+        let original_citations = fixture.receipt.candidate_citations.clone();
+        fixture
+            .receipt
+            .rendered_evidence
+            .push_str(&"selected evidence window\n".repeat(4_000));
+        let user = crate::adjudication::user_prompt(
+            "test-snapshot",
+            &fixture.candidates,
+            &fixture.ids,
+            &mut fixture.receipt,
+            &crate::envelope::RepositorySearchReceipt::default(),
+        )
+        .unwrap();
+        let corrected_bytes = user.len() + ADJUDICATION_CORRECTION_SUFFIX.len();
+        let maximum = crate::adjudication::MAX_ADJUDICATION_PROMPT_BYTES;
+        assert!(corrected_bytes <= maximum);
+        assert!(maximum - corrected_bytes < 64);
+        assert!(!fixture.receipt.rendered_evidence_complete);
+        assert_eq!(fixture.receipt.candidate_citations, original_citations);
+
+        let server = adjudication_server(vec![fixture.output(2), fixture.output(0)]).await;
+        let client = adjudication_client(&fixture, &server);
+        let review = client
+            .adjudicate_findings(
+                &fixture.cfg.model,
+                "system",
+                &user,
+                1,
+                Duration::from_secs(60),
+                |results| fixture.validate(results),
+            )
+            .await
+            .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let mut expected: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(expected["messages"][1]["content"], user);
+        expected["messages"][1]["content"] =
+            json!(format!("{user}{ADJUDICATION_CORRECTION_SUFFIX}"));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&requests[1].body).unwrap(),
+            expected
+        );
+        assert_eq!(review.application.kept.len(), 1);
+        assert!(review.application.suppressed.is_empty());
+        assert_eq!(
+            serde_json::to_value(&fixture.candidates).unwrap(),
+            original_candidates
+        );
+        assert_eq!(review.usage.prompt_tokens, 20);
+        assert_eq!(review.usage.completion_tokens, 4);
+        assert_eq!(review.usage.cost_micros, Some(6));
+        assert!(review.usage_accounting_complete);
+        assert_eq!(review.model_incidents.len(), 1);
+        assert!(review.model_incidents[0].recovered);
+        assert_eq!(
+            review.model_incidents[0].recovery,
+            Some(ModelIncidentRecovery::Repair)
+        );
+        assert_eq!(
+            review.model_usage[1].phase,
+            Some(ModelUsagePhase::SemanticRetry)
+        );
+    }
+
     #[test]
     fn adjudication_admission_prompt_bound_covers_the_correction() {
         let mut client = LlmClient::build(
@@ -10378,7 +10448,7 @@ mod tests {
             };
             let mut client = LlmClient::build(
                 &config,
-                "test-key".into(),
+                std::process::id().to_string(),
                 Duration::from_secs(5),
                 None,
                 None,
