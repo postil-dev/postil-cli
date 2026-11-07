@@ -6379,7 +6379,7 @@ mod tests {
 
     #[test]
     fn source_packing_preserves_mandatory_identity_at_actual_admission() {
-        let source = capacity_coverage_fixture(32_768, 22);
+        let source = capacity_coverage_fixture(32_768, 21);
         let parsed = parse(&source);
         assert_eq!(
             json_string_content_bytes(&format!(
@@ -6400,7 +6400,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             sizes,
-            std::iter::repeat_n(31_776, 22)
+            std::iter::repeat_n(31_776, 21)
                 .chain([19_182, 22_379, 12_788, 9_591])
                 .collect::<Vec<_>>()
         );
@@ -6411,7 +6411,7 @@ mod tests {
         };
         let limit = crate::review::MAX_LARGE_DIFF_SELECTED_BATCHES
             .min(crate::llm::max_hosted_review_batches(&cfg, false).unwrap());
-        assert_eq!(limit, 23);
+        assert_eq!(limit, 22);
         let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
         let mut prepared = prepare_review(&snapshot).unwrap();
         let mut baseline =
@@ -6427,8 +6427,8 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!((baseline.source_count, candidate.source_count), (25, 24));
-        let d = HunkIdentity::new("src/auth/d.rs", &parsed.files[25].hunks[0]);
+        assert_eq!((baseline.source_count, candidate.source_count), (24, 23));
+        let d = HunkIdentity::new("src/auth/d.rs", &parsed.files[24].hunks[0]);
         assert_eq!(
             d.canonical(),
             [
@@ -6443,8 +6443,8 @@ mod tests {
         );
         let b = baseline.deterministic_bounded_receipt(limit).unwrap();
         let c = candidate.deterministic_bounded_receipt(limit).unwrap();
-        assert_eq!((b.direct_hunks(), b.unreviewed_hunks()), (24, 2));
-        assert_eq!((c.direct_hunks(), c.unreviewed_hunks()), (24, 2));
+        assert_eq!((b.direct_hunks(), b.unreviewed_hunks()), (23, 2));
+        assert_eq!((c.direct_hunks(), c.unreviewed_hunks()), (23, 2));
         assert!(
             b.entries
                 .iter()

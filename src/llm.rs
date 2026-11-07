@@ -730,6 +730,8 @@ const MAX_PROVIDER_TOKEN_EXPOSURE: usize =
 const MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG: usize = 64;
 const MAX_LOGICAL_CALLS_PER_REVIEW_MODEL: usize = 2;
 const MAX_LOGICAL_CALLS_PER_SCORER_MODEL: usize = 2;
+// One initial call and one shared syntax or semantic correction.
+const MAX_LOGICAL_CALLS_PER_ADJUDICATION: usize = 2;
 const MAX_LOGICAL_CALLS_PER_RESOLUTION_MODEL: usize = 2;
 const MAX_LOGICAL_CALLS_PER_BREVITY_MODEL: usize = 1;
 const MAX_TRANSPORT_ATTEMPTS_PER_CALL: usize = TRANSIENT_RETRIES as usize + 1;
@@ -783,7 +785,7 @@ fn planned_postprocessing_calls(cfg: &Config) -> Result<usize> {
     };
     resolution_calls
         .checked_add(brevity_calls)
-        .and_then(|value| value.checked_add(1))
+        .and_then(|value| value.checked_add(MAX_LOGICAL_CALLS_PER_ADJUDICATION))
         .context("planned postprocessing call count overflowed")
 }
 
@@ -2680,7 +2682,12 @@ impl LlmClient {
             0.0,
             LlmPhase::Adjudication,
         )?;
-        exposure.add_path(&adjudication_path, adjudication_price)?;
+        // User prompts are serialized JSON, so controls are already escaped.
+        // Quotes bound their outer serialized expansion. The correction suffix
+        // fits inside the same user-byte limit for both logical calls.
+        for _ in 0..MAX_LOGICAL_CALLS_PER_ADJUDICATION {
+            exposure.add_path(&adjudication_path, adjudication_price)?;
+        }
 
         if let Some((manifest, max_selected)) = planner {
             let user = planner_user_prompt(manifest, max_selected);
@@ -3333,7 +3340,7 @@ impl LlmClient {
             error
         };
         // Syntax and semantic correction share this one operation's budget.
-        for call in 0..2 {
+        for call in 0..MAX_LOGICAL_CALLS_PER_ADJUDICATION {
             Self::adjudication_trace_for_call(
                 adjudication_record("callStarted", "chatTerminal", "started"),
                 call_phase,
@@ -3436,7 +3443,9 @@ impl LlmClient {
                     });
                 }
             }
-            let Some(next_phase) = correction_phase.filter(|_| call == 0) else {
+            let Some(next_phase) =
+                correction_phase.filter(|_| call + 1 < MAX_LOGICAL_CALLS_PER_ADJUDICATION)
+            else {
                 break;
             };
             let corrected = client
@@ -8095,8 +8104,9 @@ mod tests {
                 * MAX_LOGICAL_CALLS_PER_REVIEW_MODEL as u64
                 + u64::from(MAX_ADJUDICATION_OUTPUT_TOKENS)
                     * MAX_TRANSPORT_ATTEMPTS_PER_CALL as u64
+                    * MAX_LOGICAL_CALLS_PER_ADJUDICATION as u64
         );
-        assert_eq!(admission.provider_attempts, 29);
+        assert_eq!(admission.provider_attempts, 32);
         let plan = client
             .plan_review_batches(
                 &config,
@@ -8903,9 +8913,10 @@ mod tests {
                 + compression_per_model)
                 + u64::from(MAX_ADJUDICATION_OUTPUT_TOKENS)
                     * MAX_TRANSPORT_ATTEMPTS_PER_CALL as u64
+                    * MAX_LOGICAL_CALLS_PER_ADJUDICATION as u64
         );
-        assert_eq!(admission.provider_attempts, 157);
-        assert_eq!(admission.projected_cost_micros, 314);
+        assert_eq!(admission.provider_attempts, 160);
+        assert_eq!(admission.projected_cost_micros, 320);
     }
 
     #[test]
@@ -8962,8 +8973,9 @@ mod tests {
                 * MAX_LOGICAL_CALLS_PER_REVIEW_MODEL as u64
                 + u64::from(MAX_ADJUDICATION_OUTPUT_TOKENS)
                     * MAX_TRANSPORT_ATTEMPTS_PER_CALL as u64
+                    * MAX_LOGICAL_CALLS_PER_ADJUDICATION as u64
         );
-        assert_eq!(admission.provider_attempts, 29);
+        assert_eq!(admission.provider_attempts, 32);
     }
 
     #[test]
@@ -9078,8 +9090,9 @@ mod tests {
                     * crate::brevity::MAX_COMPRESSIONS as u64
                 + u64::from(MAX_ADJUDICATION_OUTPUT_TOKENS)
                     * MAX_TRANSPORT_ATTEMPTS_PER_CALL as u64
+                    * MAX_LOGICAL_CALLS_PER_ADJUDICATION as u64
         );
-        assert_eq!(admission.provider_attempts, 184);
+        assert_eq!(admission.provider_attempts, 187);
         assert_eq!(client.admission.lock().unwrap().attempts, 0);
     }
 
@@ -9173,7 +9186,9 @@ mod tests {
         let review_calls = capacity * review_model_count * MAX_LOGICAL_CALLS_PER_REVIEW_MODEL;
         let planner_calls = review_model_count * MAX_LOGICAL_CALLS_PER_REVIEW_MODEL;
         let scorer_calls = 2 * MAX_LOGICAL_CALLS_PER_SCORER_MODEL;
-        let logical_calls = review_calls + planner_calls + scorer_calls;
+        let postprocessing_calls = planned_postprocessing_calls(&config).unwrap();
+        assert_eq!(postprocessing_calls, MAX_LOGICAL_CALLS_PER_ADJUDICATION);
+        let logical_calls = review_calls + planner_calls + scorer_calls + postprocessing_calls;
 
         assert!(logical_calls <= MAX_HOSTED_PLANNED_CALLS_BY_WATCHDOG);
         assert!(logical_calls * MAX_TRANSPORT_ATTEMPTS_PER_CALL <= MAX_PROVIDER_ATTEMPTS);
@@ -9205,13 +9220,13 @@ mod tests {
             ..Config::default()
         };
         for (generator_count, scorer_count, without_planner, with_planner) in [
-            (1, 0, Some(24), Some(23)),
-            (1, 1, Some(23), Some(22)),
-            (1, 2, Some(22), Some(21)),
+            (1, 0, Some(23), Some(22)),
+            (1, 1, Some(22), Some(21)),
+            (1, 2, Some(21), Some(20)),
             (2, 0, Some(8), Some(7)),
             (2, 1, Some(7), Some(6)),
             (2, 2, Some(7), Some(6)),
-            (3, 0, Some(3), Some(2)),
+            (3, 0, Some(2), Some(1)),
             (3, 1, Some(2), Some(1)),
             (3, 2, Some(2), Some(1)),
         ] {
@@ -9549,7 +9564,7 @@ mod tests {
                 concurrency,
                 planned_review_models(&config).len()
             ),
-            (240, 23, 4, 1)
+            (240, 22, 4, 1)
         );
         for elapsed in [0, 70, 119, 121, 240] {
             let started = Instant::now() - Duration::from_secs(elapsed);
@@ -10098,12 +10113,359 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn adjudication_admission_reserves_both_transport_paths() {
+        let mut fixture = AdjudicationFixture::new(false, 1);
+        fixture.cfg.model = "z-ai/glm-5.2".into();
+        fixture.cfg.uncertainty_resolution = false;
+        fixture.cfg.concise_findings = false;
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicU32::new(0));
+        let observed = calls.clone();
+        let repaired = fixture.output(0);
+        let unsupported_refutation = fixture.output(2);
+        Mock::given(method("POST"))
+            .respond_with(move |_: &wiremock::Request| {
+                let call = observed.fetch_add(1, Ordering::Relaxed);
+                assert!(call < 6, "unexpected extra adjudication attempt");
+                if call % 3 < 2 {
+                    return ResponseTemplate::new(500);
+                }
+                let content = if call == 2 {
+                    &unsupported_refutation
+                } else {
+                    &repaired
+                };
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "choices":[{"finish_reason":"stop","message":{"content":content}}],
+                    "usage":{"prompt_tokens":10,"completion_tokens":2,"cost":0.000003}
+                }))
+            })
+            .mount(&server)
+            .await;
+        let mut client = adjudication_client(&fixture, &server);
+        client.request_decorations.hosted_price_bounds = Some(Arc::new(HashMap::from([(
+            fixture.cfg.model.clone(),
+            ModelPriceBound {
+                model: fixture.cfg.model.clone(),
+                input_micros_per_million_tokens: 1,
+                output_micros_per_million_tokens: 1,
+            },
+        )])));
+        let users = ["candidate".to_owned()];
+        let output_tokens = [REVIEW_MAX_TOKENS];
+        let admission = client
+            .preflight_review_plan_with_output_limits(
+                &fixture.cfg,
+                1,
+                "system",
+                ReviewPreflightPrompts {
+                    first_users: &users,
+                    later_users: &users,
+                    output_tokens: &output_tokens,
+                    scorer_system: "unused",
+                    current_utc_date: trusted_date(),
+                },
+                ReviewPlanSchedule {
+                    planner: None,
+                    batch_concurrency: 1,
+                },
+            )
+            .unwrap();
+        // Two review calls have thirteen attempts each. Adjudication owns six.
+        assert_eq!(admission.provider_attempts, 26 + 6);
+        assert_eq!(planned_postprocessing_calls(&fixture.cfg).unwrap(), 2);
+        let review = client
+            .adjudicate_findings(
+                &fixture.cfg.model,
+                "system",
+                "original immutable evidence",
+                1,
+                Duration::from_secs(60),
+                |results| fixture.validate(results),
+            )
+            .await
+            .unwrap();
+        assert_eq!(review.application.kept.len(), 1);
+        assert_eq!(calls.load(Ordering::Relaxed), 6);
+        assert_eq!(client.admission.lock().unwrap().attempts, 6);
+        assert_eq!(review.usage.prompt_tokens, 20);
+        assert_eq!(review.usage.completion_tokens, 4);
+        assert_eq!(review.usage.cost_micros, Some(6));
+        assert!(!review.usage_accounting_complete);
+    }
+
+    #[test]
+    fn adjudication_admission_prompt_bound_covers_the_correction() {
+        let mut client = LlmClient::build(
+            &Config::default(),
+            std::process::id().to_string(),
+            Duration::from_secs(5),
+            None,
+            None,
+        )
+        .unwrap();
+        let price = ModelPriceBound {
+            model: "z-ai/glm-5.2".into(),
+            input_micros_per_million_tokens: 1,
+            output_micros_per_million_tokens: 1,
+        };
+        client.request_decorations.hosted_price_bounds = Some(Arc::new(HashMap::from([(
+            price.model.clone(),
+            price.clone(),
+        )])));
+        let maximum = crate::adjudication::MAX_ADJUDICATION_PROMPT_BYTES;
+        let system = crate::adjudication::system_prompt(trusted_date());
+        let planned = client
+            .planned_request_path(
+                "z-ai/glm-5.2",
+                &system,
+                &"\"".repeat(maximum),
+                MAX_ADJUDICATION_OUTPUT_TOKENS,
+                0.0,
+                LlmPhase::Adjudication,
+            )
+            .unwrap();
+        let mut exposure = PlannedExposure::default();
+        exposure.add_path(&planned, &price).unwrap();
+        exposure.add_path(&planned, &price).unwrap();
+        for atom in ["\"", "\\", "é", "\\u0000", "\\u001f", "\\n"] {
+            let user = atom.repeat((maximum - ADJUDICATION_CORRECTION_SUFFIX.len()) / atom.len());
+            let corrected = adjudication_correction_user(&user).unwrap();
+            assert!(corrected.len() <= maximum);
+            for actual in [&user, &corrected] {
+                let body = client.request_body(
+                    "z-ai/glm-5.2",
+                    &system,
+                    actual,
+                    MAX_ADJUDICATION_OUTPUT_TOKENS,
+                    0.0,
+                    LlmPhase::Adjudication,
+                );
+                let bytes = serialized_provider_request_bytes(&body, "test request").unwrap();
+                assert!(planned.attempts.iter().all(|(limit, _)| bytes <= *limit));
+                // Generate every possible transport count up to the complete
+                // initial-plus-correction path for each prompt boundary.
+                for attempts in 1..=6 {
+                    *client.admission.lock().unwrap() = Default::default();
+                    for _ in 0..attempts {
+                        client.reserve_provider_attempt(&body).unwrap();
+                        let observed = client.admission.lock().unwrap();
+                        assert!(observed.attempts <= exposure.attempts);
+                        assert!(observed.input_bytes <= exposure.input_bytes);
+                        assert!(observed.output_token_exposure <= exposure.output_tokens);
+                        assert!(
+                            observed.projected_cost_exposure_micros
+                                <= exposure.projected_cost_micros
+                        );
+                        assert!(
+                            observed.projected_cost_exposure_micros
+                                <= HOSTED_OPERATION_COST_CAP_MICROS
+                        );
+                    }
+                    assert_eq!(client.admission.lock().unwrap().attempts, attempts);
+                }
+            }
+        }
+        // The production constructor serializes its entire evidence payload.
+        // Every control byte is escaped before outer request serialization.
+        for byte in 0..=31u8 {
+            let user = serde_json::to_string(&json!({
+                "evidence": char::from(byte).to_string().repeat(1_500),
+            }))
+            .unwrap();
+            assert!(user.bytes().all(|byte| byte >= 32));
+            let corrected = adjudication_correction_user(&user).unwrap();
+            let body = client.request_body(
+                "z-ai/glm-5.2",
+                &system,
+                &corrected,
+                MAX_ADJUDICATION_OUTPUT_TOKENS,
+                0.0,
+                LlmPhase::Adjudication,
+            );
+            let bytes = serialized_provider_request_bytes(&body, "test request").unwrap();
+            assert!(planned.attempts.iter().all(|(limit, _)| bytes <= *limit));
+        }
+    }
+
+    #[test]
+    fn adjudication_admission_correction_rejects_an_underfunded_plan() {
+        let config = Config {
+            model: "z-ai/glm-5.2".into(),
+            scorer_enabled: false,
+            uncertainty_resolution: false,
+            concise_findings: false,
+            ..Config::default()
+        };
+        let mut client = LlmClient::build(
+            &config,
+            std::process::id().to_string(),
+            Duration::from_secs(5),
+            None,
+            None,
+        )
+        .unwrap();
+        let users = ["candidate".to_owned()];
+        let output_tokens = [REVIEW_MAX_TOKENS];
+        let review_paths = client
+            .planned_review_request_paths(&config.model, "system", &users[0], REVIEW_MAX_TOKENS)
+            .unwrap();
+        let system = crate::adjudication::system_prompt(trusted_date());
+        let user = "\"".repeat(crate::adjudication::MAX_ADJUDICATION_PROMPT_BYTES);
+        let adjudication_path = client
+            .planned_request_path(
+                &config.model,
+                &system,
+                &user,
+                MAX_ADJUDICATION_OUTPUT_TOKENS,
+                0.0,
+                LlmPhase::Adjudication,
+            )
+            .unwrap();
+        let old_output = review_paths
+            .iter()
+            .chain([&adjudication_path])
+            .flat_map(|path| &path.attempts)
+            .map(|(_, tokens)| *tokens as u64)
+            .sum::<u64>();
+        let price = ModelPriceBound {
+            model: config.model.clone(),
+            input_micros_per_million_tokens: 0,
+            // Leave room for per-attempt rounding below the projection cap.
+            output_micros_per_million_tokens: (HOSTED_ADMISSION_PROJECTION_CAP_MICROS - 1_000)
+                * 1_000_000
+                / old_output,
+        };
+        let mut omitted = PlannedExposure::default();
+        for path in review_paths.iter().chain([&adjudication_path]) {
+            omitted.add_path(path, &price).unwrap();
+        }
+        assert!(client.validate_hosted_exposure("test", &omitted).is_ok());
+        let mut complete = PlannedExposure::default();
+        complete.add_exposure(&omitted).unwrap();
+        complete.add_path(&adjudication_path, &price).unwrap();
+        assert!(complete.projected_cost_micros > HOSTED_ADMISSION_PROJECTION_CAP_MICROS);
+        client.request_decorations.hosted_price_bounds =
+            Some(Arc::new(HashMap::from([(config.model.clone(), price)])));
+        let error = client
+            .preflight_review_plan_with_output_limits(
+                &config,
+                1,
+                "system",
+                ReviewPreflightPrompts {
+                    first_users: &users,
+                    later_users: &users,
+                    output_tokens: &output_tokens,
+                    scorer_system: "unused",
+                    current_utc_date: trusted_date(),
+                },
+                ReviewPlanSchedule {
+                    planner: None,
+                    batch_concurrency: 1,
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("admission projection cap"));
+        assert_eq!(client.admission.lock().unwrap().attempts, 0);
+    }
+
+    #[test]
+    fn adjudication_admission_competing_reservations_preserve_the_spend_cap() {
+        for remaining in 0..=4 {
+            let config = Config {
+                model: "provider/model".into(),
+                ..Config::default()
+            };
+            let mut client = LlmClient::build(
+                &config,
+                "test-key".into(),
+                Duration::from_secs(5),
+                None,
+                None,
+            )
+            .unwrap();
+            let price = ModelPriceBound {
+                model: config.model.clone(),
+                input_micros_per_million_tokens: 1,
+                output_micros_per_million_tokens: 1,
+            };
+            client.request_decorations.hosted_price_bounds = Some(Arc::new(HashMap::from([(
+                config.model.clone(),
+                price.clone(),
+            )])));
+            let body = client.request_body(
+                &config.model,
+                "system",
+                "immutable evidence",
+                MAX_ADJUDICATION_OUTPUT_TOKENS,
+                0.0,
+                LlmPhase::Adjudication,
+            );
+            let bytes = serialized_provider_request_bytes(&body, "test request").unwrap();
+            let cost = projected_request_cost_micros(
+                bytes,
+                MAX_ADJUDICATION_OUTPUT_TOKENS as usize,
+                &price,
+            )
+            .unwrap();
+            client
+                .admission
+                .lock()
+                .unwrap()
+                .projected_cost_exposure_micros =
+                HOSTED_OPERATION_COST_CAP_MICROS - remaining * cost;
+            let barrier = Arc::new(std::sync::Barrier::new(4));
+            let client = Arc::new(client);
+            let workers = (0..4)
+                .map(|_| {
+                    let client = client.clone();
+                    let barrier = barrier.clone();
+                    let body = body.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        let accepted = client.reserve_provider_attempt(&body).is_ok();
+                        assert!(
+                            client
+                                .admission
+                                .lock()
+                                .unwrap()
+                                .projected_cost_exposure_micros
+                                <= HOSTED_OPERATION_COST_CAP_MICROS
+                        );
+                        accepted
+                    })
+                })
+                .collect::<Vec<_>>();
+            let accepted = workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .filter(|accepted| *accepted)
+                .count();
+            let admission = client.admission.lock().unwrap();
+            assert_eq!(accepted as u64, remaining);
+            assert_eq!(admission.attempts, accepted);
+            assert_eq!(admission.input_bytes, accepted * bytes);
+            assert_eq!(
+                admission.output_token_exposure,
+                accepted * MAX_ADJUDICATION_OUTPUT_TOKENS as usize
+            );
+            assert_eq!(
+                admission.projected_cost_exposure_micros,
+                HOSTED_OPERATION_COST_CAP_MICROS
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn adjudication_recovery_generated_outcomes_share_one_correction() {
         // Exhaustive generated outcome pairs exercise the real parser and the
         // complete caller validator, including its applied-result guard.
         for context in [false, true] {
             for fresh in [0, 1] {
-                let fixture = AdjudicationFixture::new(context, fresh);
+                let mut fixture = AdjudicationFixture::new(context, fresh);
+                fixture.cfg.model = "z-ai/glm-5.2".into();
+                fixture.cfg.uncertainty_resolution = false;
+                fixture.cfg.concise_findings = false;
                 for first in 0..5 {
                     for second in 0..5 {
                         let first_valid = first == 0 || (first == 4 && !context);
@@ -10114,9 +10476,39 @@ mod tests {
                             fixture.output(second),
                         ])
                         .await;
-                        let client = adjudication_client(&fixture, &server);
+                        let mut client = adjudication_client(&fixture, &server);
+                        client.request_decorations.hosted_price_bounds =
+                            Some(Arc::new(HashMap::from([(
+                                fixture.cfg.model.clone(),
+                                ModelPriceBound {
+                                    model: fixture.cfg.model.clone(),
+                                    input_micros_per_million_tokens: 10_000,
+                                    output_micros_per_million_tokens: 100_000,
+                                },
+                            )])));
                         let original = serde_json::to_value(&fixture.candidates).unwrap();
                         let user = "original immutable evidence";
+                        let users = [user.to_owned()];
+                        let output_tokens = [REVIEW_MAX_TOKENS];
+                        let planned = client
+                            .preflight_review_plan_with_output_limits(
+                                &fixture.cfg,
+                                1,
+                                "system",
+                                ReviewPreflightPrompts {
+                                    first_users: &users,
+                                    later_users: &users,
+                                    output_tokens: &output_tokens,
+                                    scorer_system: "unused",
+                                    current_utc_date: trusted_date(),
+                                },
+                                ReviewPlanSchedule {
+                                    planner: None,
+                                    batch_concurrency: 1,
+                                },
+                            )
+                            .unwrap();
+                        assert_eq!(planned.provider_attempts, 32);
                         let result = client
                             .adjudicate_findings(
                                 &fixture.cfg.model,
@@ -10129,6 +10521,20 @@ mod tests {
                             .await;
                         let count = if first_valid || !eligible { 1 } else { 2 };
                         let requests = server.received_requests().await.unwrap();
+                        let observed = client.admission.lock().unwrap();
+                        assert!(observed.attempts <= 6);
+                        assert_eq!(observed.attempts, requests.len());
+                        assert!(observed.input_bytes as u64 <= planned.serialized_input_bytes);
+                        assert!(observed.output_token_exposure as u64 <= planned.output_tokens);
+                        assert!(
+                            observed.projected_cost_exposure_micros
+                                <= planned.projected_cost_micros
+                        );
+                        assert!(
+                            observed.projected_cost_exposure_micros
+                                <= HOSTED_OPERATION_COST_CAP_MICROS
+                        );
+                        drop(observed);
                         assert_eq!(requests.len(), count, "{context}/{fresh}/{first}/{second}");
                         assert_eq!(
                             result.is_ok(),
