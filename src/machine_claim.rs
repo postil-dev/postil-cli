@@ -1928,7 +1928,11 @@ mod tests {
                     },
                     MachineSourceFile {
                         path: "src/llm.rs".into(),
-                        source: include_str!("llm.rs").into(),
+                        source: include_str!("llm.rs")
+                            .split_once("#[cfg(test)]\nmod tests {")
+                            .expect("LLM source has a separate test module")
+                            .0
+                            .into(),
                     },
                 ],
             },
