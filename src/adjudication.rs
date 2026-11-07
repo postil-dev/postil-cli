@@ -14,6 +14,9 @@ pub(crate) const MAX_ADJUDICATION_CANDIDATES: usize = 20;
 pub(crate) const MAX_ADJUDICATION_CORPUS_BYTES: usize = 24 * 1024;
 pub(crate) const MAX_ADJUDICATION_PROMPT_BYTES: usize = 48 * 1024;
 pub(crate) const MAX_ADJUDICATION_OUTPUT_TOKENS: u32 = 8_000;
+pub(crate) const ADJUDICATION_CORRECTION_SUFFIX: &str = "\n\nReturn the complete adjudication JSON array for the original candidate IDs. Correct the rejected output using only the supplied evidence. A refutation needs candidate-specific contradictory evidence, not its own citation or unsupported prose. A context-anchored confirmation needs an exact causal change reference. Preserve all structural, scope and publication rules. Never invent evidence or references, silently drop a candidate, or fabricate a verdict.";
+const MAX_ADJUDICATION_INITIAL_PROMPT_BYTES: usize =
+    MAX_ADJUDICATION_PROMPT_BYTES - ADJUDICATION_CORRECTION_SUFFIX.len();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AdjudicationViolation {
@@ -1135,7 +1138,7 @@ pub(crate) fn user_prompt_with_feedback(
         Ok(serde_json::to_string(&payload)?)
     };
     let prompt = render(diff_receipt)?;
-    if prompt.len() <= MAX_ADJUDICATION_PROMPT_BYTES {
+    if prompt.len() <= MAX_ADJUDICATION_INITIAL_PROMPT_BYTES {
         return Ok(prompt);
     }
 
@@ -1143,7 +1146,7 @@ pub(crate) fn user_prompt_with_feedback(
     diff_receipt.rendered_evidence_complete = false;
     let minimum = render(diff_receipt)?;
     ensure!(
-        minimum.len() <= MAX_ADJUDICATION_PROMPT_BYTES,
+        minimum.len() <= MAX_ADJUDICATION_INITIAL_PROMPT_BYTES,
         "complete adjudication candidate set exceeds its input bound"
     );
 
@@ -1159,7 +1162,7 @@ pub(crate) fn user_prompt_with_feedback(
         let midpoint = low + (high - low).div_ceil(2);
         diff_receipt.rendered_evidence = original_evidence[..line_ends[midpoint - 1]].into();
         let candidate = render(diff_receipt)?;
-        if candidate.len() <= MAX_ADJUDICATION_PROMPT_BYTES {
+        if candidate.len() <= MAX_ADJUDICATION_INITIAL_PROMPT_BYTES {
             best_evidence.clone_from(&diff_receipt.rendered_evidence);
             best = candidate;
             low = midpoint;
@@ -6005,7 +6008,9 @@ mod tests {
         )
         .unwrap();
         let payload: serde_json::Value = serde_json::from_str(&enriched).unwrap();
-        assert!(enriched.len() <= MAX_ADJUDICATION_PROMPT_BYTES);
+        assert!(
+            enriched.len() + ADJUDICATION_CORRECTION_SUFFIX.len() <= MAX_ADJUDICATION_PROMPT_BYTES
+        );
         assert_eq!(
             payload["reviewFeedback"]["conversation"]["threads"][0]["resolved"],
             true
@@ -6104,7 +6109,9 @@ mod tests {
         .unwrap();
         let payload: serde_json::Value = serde_json::from_str(&prompt).unwrap();
 
-        assert!(prompt.len() <= MAX_ADJUDICATION_PROMPT_BYTES);
+        assert!(
+            prompt.len() + ADJUDICATION_CORRECTION_SUFFIX.len() <= MAX_ADJUDICATION_PROMPT_BYTES
+        );
         assert_eq!(payload["candidates"].as_array().unwrap().len(), 1);
         assert_eq!(
             payload["diffCorpusReceipt"]["renderedEvidenceComplete"],

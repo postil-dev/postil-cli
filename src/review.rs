@@ -5192,7 +5192,7 @@ mod tests {
         assert_eq!(hosted_review_timeout_secs(&scorer_disabled), 360);
         assert_eq!(
             crate::llm::max_hosted_review_batches(&scorer_disabled, false).unwrap(),
-            24
+            23
         );
 
         let scorer_enabled_budgets = hosted_review_phase_budgets(&scorer_enabled);
@@ -5213,7 +5213,7 @@ mod tests {
         assert_eq!(hosted_review_timeout_secs(&scorer_enabled), 240);
         assert_eq!(
             crate::llm::max_hosted_review_batches(&scorer_enabled, false).unwrap(),
-            23
+            22
         );
     }
 
