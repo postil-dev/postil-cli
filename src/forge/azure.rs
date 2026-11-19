@@ -933,20 +933,21 @@ mod tests {
     fn generated_marker_sections_preserve_paths_and_reject_partial_reviews() {
         let mut sections = Vec::new();
         for path in ["src/plain.rs", "src/sp ace.rs", "src/quo\"te.rs"] {
-            for (old_path, new_path, old, new, add, delete) in [
-                (path, path, "", "", true, false),
-                (path, path, "", "", false, true),
-                (path, "src/new.rs", "same\n", "same\n", false, false),
+            for (old_path, new_path, add, delete) in [
+                (format!("{path}.add"), format!("{path}.add"), true, false),
+                (format!("{path}.del"), format!("{path}.del"), false, true),
+                (format!("{path}.old"), format!("{path}.new"), false, false),
             ] {
-                let section = diff_section(old_path, new_path, old, new, add, delete);
+                let content = if add || delete { "" } else { "same\n" };
+                let section = diff_section(&old_path, &new_path, content, content, add, delete);
                 assert!(!section.contains("@@"));
                 sections.push((section, old_path, new_path));
             }
         }
         sections.push((
             "diff --git a/src/old b/name.rs b/src/new b/name.rs\n--- a/src/old b/name.rs\n+++ b/src/new b/name.rs\n".to_string(),
-            "src/old b/name.rs",
-            "src/new b/name.rs",
+            "src/old b/name.rs".to_string(),
+            "src/new b/name.rs".to_string(),
         ));
         for shift in [0, 1, sections.len() - 1] {
             let ordered = (0..sections.len())
@@ -966,7 +967,7 @@ mod tests {
             let parsed = diff::parse(&source);
             assert!(parsed.complete);
             for (file, (_, old, new)) in parsed.files.iter().zip(ordered) {
-                assert_eq!((&*file.old_path, &*file.path), (*old, *new));
+                assert_eq!((&*file.old_path, &*file.path), (old.as_str(), new.as_str()));
             }
             assert_eq!(parsed.files.len(), sections.len());
         }
