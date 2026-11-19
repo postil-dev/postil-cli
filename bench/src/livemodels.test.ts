@@ -1395,17 +1395,19 @@ describe("managed admission workflow", () => {
     expect(calibration).toContain("--record");
     expect(calibration).not.toContain("bench/baseline.json");
     expect(calibration.match(/--screen-profile \.\.\/provisional-models-us\.json/gu)).toHaveLength(5);
-    expect(calibration).toContain("--baseline baseline-us.json");
-    expect(calibration).toContain("subject-path: ${{ github.workspace }}/bench/baseline-us.json");
-    expect(calibration).toContain('cp bench/baseline-us.json "${RUNNER_TEMP}/populated-baseline/baseline-us.json"');
-    expect(calibration).toContain("/populated-baseline/baseline-us.attestation.json");
+    expect(calibration).toContain('profile="openai/gpt-6-luna"');
+    expect(calibration).toContain("--baseline baseline-gpt6-us.json");
+    expect(calibration).toContain("subject-path: ${{ github.workspace }}/bench/baseline-gpt6-us.json");
+    expect(calibration).toContain('cp bench/baseline-gpt6-us.json "${RUNNER_TEMP}/populated-baseline/baseline-gpt6-us.json"');
+    expect(calibration).toContain("/populated-baseline/baseline-gpt6-us.attestation.json");
     expect(calibration).toContain("name: benchmark-calibration-us-baseline-${{ github.run_id }}");
     expect(release).toContain("New releases require the populated Azure/US baseline and its main-branch first-attempt calibration attestation.");
     expect(release).not.toContain("provisional-models.json");
     expect(release).toContain("--screen-profile ../provisional-models-us.json");
     expect(release).not.toContain("bench/baseline.json");
-    expect(release).toContain("--baseline baseline-us.json");
-    expect(release).toContain("--bundle bench/baseline-us.attestation.json");
+    expect(release).toContain('profile="openai/gpt-6-luna"');
+    expect(release).toContain("--baseline baseline-gpt6-us.json");
+    expect(release).toContain("--bundle bench/baseline-gpt6-us.attestation.json");
     expect(release).toContain("--signer-workflow postil-dev/postil-cli/.github/workflows/benchmark-calibration.yml");
     expect(release).not.toContain("workflow_dispatch");
     expect(release).toContain("name: Require the unique first release run for this tag");
@@ -1415,7 +1417,7 @@ describe("managed admission workflow", () => {
     expect(release).toContain("group: release-${{ github.ref_name }}");
     expect(release).toContain('gh release view "${GITHUB_REF_NAME}"');
     expect(release).toContain("name: Verify the attested Azure/US Luna calibration baseline");
-    expect(release).toContain("bench/baseline-us.attestation.json");
+    expect(release).toContain("bench/baseline-gpt6-us.attestation.json");
     expect(release).toContain('git/ref/tags/postil-calibration-${source_sha}');
     expect(release).toContain(
       "--signer-workflow postil-dev/postil-cli/.github/workflows/benchmark-calibration.yml",

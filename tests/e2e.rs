@@ -2566,7 +2566,7 @@ async fn routed_http_200_errors_log_each_attempt_without_exposing_response_conte
             .await;
         if recover {
             let mut response = llm_content(json!([]));
-            response["model"] = json!("openai/gpt-5.6-luna");
+            response["model"] = json!("openai/gpt-6-luna");
             response["provider"] = json!("Azure");
             Mock::given(method("POST"))
                 .and(path("/chat/completions"))
@@ -2881,7 +2881,7 @@ async fn hosted_source_coverage_extends_beyond_three_waves_without_raising_hard_
         .and(path("/chat/completions"))
         .respond_with(|_: &Request| {
             let mut response = llm_content(json!([]));
-            response["model"] = json!("openai/gpt-5.6-luna");
+            response["model"] = json!("openai/gpt-6-luna");
             response["provider"] = json!("Azure");
             ResponseTemplate::new(200).set_body_json(response)
         })
@@ -4147,7 +4147,7 @@ async fn hosted_pending_refutation_failure_preserves_the_strict_blocker() {
                         "title": "Validate query input", "body": "The query executes unvalidated input.", "evidence": "exec_query(&token);"
                     }]))
                 };
-                response["model"] = json!("openai/gpt-5.6-luna");
+                response["model"] = json!("openai/gpt-6-luna");
                 response["provider"] = json!("Azure");
                 ResponseTemplate::new(200).set_body_json(response)
             }).with_priority(1).mount(&server).await;
@@ -7168,7 +7168,7 @@ fn hosted_config_ignores_repository_model_provider_and_scorer() {
     assert!(stdout.contains("model.name: "));
     assert!(stdout.contains("model.cascade: []"));
     assert!(stdout.contains("model.scorer: "));
-    assert!(!stdout.contains("model.scorer: openai/gpt-5.6-luna"));
+    assert!(!stdout.contains("model.scorer: openai/gpt-6-luna"));
     assert!(stdout.contains("model.reasoningEffort: low"));
     assert!(stdout.contains("model.scorerReasoningEffort: low"));
     assert!(stdout.contains("model.apiBase: https://openrouter.ai/api/v1"));
@@ -7200,9 +7200,9 @@ fn provisional_hosted_config_uses_only_the_baked_roster() {
         .success();
     let stdout = String::from_utf8(out.get_output().stdout.clone()).unwrap();
 
-    assert!(stdout.contains("model.name: openai/gpt-5.6-luna"));
+    assert!(stdout.contains("model.name: openai/gpt-6-luna"));
     assert!(stdout.contains("model.cascade: []"));
-    assert!(stdout.contains("model.scorer: openai/gpt-5.6-luna"));
+    assert!(stdout.contains("model.scorer: openai/gpt-6-luna"));
     assert!(stdout.contains("model.reasoningEffort: low"));
     assert!(stdout.contains("model.scorerReasoningEffort: low"));
     assert!(stdout.contains("model.apiBase: https://openrouter.ai:443/api/v1"));
@@ -7294,7 +7294,7 @@ async fn bare_review_selects_a_nonempty_local_change_and_reaches_the_provider() 
         .success();
     let envelope: Value = serde_json::from_slice(&output.get_output().stdout).unwrap();
     assert_eq!(envelope["silent"], true);
-    assert_eq!(envelope["modelUsed"], "openai/gpt-5.6-luna");
+    assert_eq!(envelope["modelUsed"], "openai/gpt-6-luna");
 
     let requests = server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
@@ -7320,7 +7320,7 @@ fn review_with_the_embedded_model_reports_a_missing_provider_credential() {
 
     let stderr = String::from_utf8_lossy(&out.get_output().stderr);
     assert!(stderr.contains("no API key"));
-    assert!(stderr.contains("openai/gpt-5.6-luna"));
+    assert!(stderr.contains("openai/gpt-6-luna"));
     assert!(stderr.contains("postil models"));
 }
 
@@ -7820,16 +7820,16 @@ fn models_and_config_explain_the_embedded_default() {
     let models = String::from_utf8(models).unwrap();
     assert!(models.contains("Postil model support (offline)"));
     assert!(models.contains("No model setting is required"));
-    assert!(models.contains("Embedded local reviewer (Luna): openai/gpt-5.6-luna"));
+    assert!(models.contains("Embedded local reviewer (Luna): openai/gpt-6-luna"));
     assert!(models.contains("Reviewer source: embedded default"));
     assert!(models.contains("Reviewer reasoning effort: low"));
     assert!(models.contains("Local scorer: disabled"));
-    assert!(models.contains("Hosted scorer candidate: openai/gpt-5.6-luna"));
+    assert!(models.contains("Hosted scorer candidate: openai/gpt-6-luna"));
     assert!(models.contains("Hosted scorer reasoning effort: low"));
     assert!(models.contains("does not maintain a fixed local model-ID allowlist"));
     assert!(models.contains("OpenAI-compatible endpoints accept any non-empty endpoint model ID"));
     assert!(models.contains("OpenRouter commonly uses provider/model"));
-    assert!(models.contains("Recommended OpenRouter starting point: openai/gpt-5.6-luna"));
+    assert!(models.contains("Recommended OpenRouter starting point: openai/gpt-6-luna"));
     assert!(models.contains("postil doctor` verifies current provider availability"));
     assert!(
         models.contains(
@@ -7856,7 +7856,7 @@ fn models_and_config_explain_the_embedded_default() {
         .clone();
     let config = String::from_utf8(config).unwrap();
     assert!(config.contains("model.source: embedded default"));
-    assert!(config.contains("model.name: openai/gpt-5.6-luna"));
+    assert!(config.contains("model.name: openai/gpt-6-luna"));
     assert!(config.contains("model.reasoningEffort: low"));
     assert!(config.contains("model.reasoningEffort.source: embedded default"));
     assert!(config.contains("model.scorer.enabled: false"));
@@ -16501,7 +16501,7 @@ async fn causal_scope_contract_prevents_context_relabeling_before_scoring() {
                     llm_content(if carried { json!([]) } else { json!([generated]) })
                 };
                 if mode == "pre-existing-hosted-failed" {
-                    response["model"] = json!("openai/gpt-5.6-luna");
+                    response["model"] = json!("openai/gpt-6-luna");
                     response["provider"] = json!("Azure");
                 }
                 ResponseTemplate::new(200).set_body_json(response)

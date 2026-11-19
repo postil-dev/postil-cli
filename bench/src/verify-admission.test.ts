@@ -52,12 +52,12 @@ describe("admission attestation verification", () => {
       providerGenerationModels: Record<string, string>;
       modelPriceBounds: Array<{ model: string }>;
     };
-    expect(profile.generatorChain).toEqual(["openai/gpt-5.6-luna"]);
-    expect(profile.scorerChain).toEqual(["openai/gpt-5.6-luna"]);
+    expect(profile.generatorChain).toEqual(["openai/gpt-6-luna"]);
+    expect(profile.scorerChain).toEqual(["openai/gpt-6-luna"]);
     expect(profile.providerGenerationModels).toEqual({
-      "openai/gpt-5.6-luna": "openai/gpt-5.6-luna-20260709",
+      "openai/gpt-6-luna": "openai/gpt-6-luna-20260922",
     });
-    expect(profile.modelPriceBounds.map((bound) => bound.model)).toEqual(["openai/gpt-5.6-luna"]);
+    expect(profile.modelPriceBounds.map((bound) => bound.model)).toEqual(["openai/gpt-6-luna"]);
     expect(await verifyProvisionalRelease(
       join(repositoryRoot, "qualified-models.json"),
       join(repositoryRoot, "config.toml"),
@@ -108,7 +108,7 @@ describe("admission attestation verification", () => {
       ["scorerChain", "scorer chain must not repeat models"],
     ] as const) {
       const profile = structuredClone(baseline);
-      profile[field] = ["openai/gpt-5.6-luna", "openai/gpt-5.6-luna"];
+      profile[field] = ["openai/gpt-6-luna", "openai/gpt-6-luna"];
       await writeFile(profilePath, JSON.stringify(profile));
       await expect(verifyProvisionalRelease(manifest, config, profilePath)).rejects.toThrow(message);
     }
@@ -145,7 +145,7 @@ describe("admission attestation verification", () => {
       await readFile(join(repositoryRoot, "provisional-models.json"), "utf8"),
     ) as { providerGenerationModels: Record<string, string> };
 
-    profile.providerGenerationModels["openai/gpt-5.6-luna"] = "openai/gpt-5.6-luna";
+    profile.providerGenerationModels["openai/gpt-6-luna"] = "openai/gpt-6-luna";
     await writeFile(profilePath, JSON.stringify(profile));
     await expect(verifyProvisionalRelease(manifest, config, profilePath)).rejects.toThrow(
       "generation identities must be distinct from logical model IDs",
@@ -205,7 +205,7 @@ describe("admission attestation verification", () => {
     // embedded-default comparison instead of failing an earlier bound check.
     altered.modelPriceBounds.push({ ...altered.modelPriceBounds[0]!, model: "other/model" });
     expect(altered.modelPriceBounds.map((bound) => bound.model)).toEqual([
-      "openai/gpt-5.6-luna",
+      "openai/gpt-6-luna",
       "other/model",
     ]);
     await writeFile(profile, JSON.stringify(altered));

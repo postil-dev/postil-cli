@@ -431,8 +431,8 @@ describe("parseModels", () => {
   test("uses the embedded Luna scorer qualification candidate", async () => {
     const defaults = await loadEmbeddedScorerDefaults();
     expect(defaults.enabled).toBe(true);
-    expect(defaults.qualification_candidates).toEqual(["openai/gpt-5.6-luna"]);
-    expect(parseModels(undefined, defaults.qualification_candidates)).toEqual(["openai/gpt-5.6-luna"]);
+    expect(defaults.qualification_candidates).toEqual(["openai/gpt-6-luna"]);
+    expect(parseModels(undefined, defaults.qualification_candidates)).toEqual(["openai/gpt-6-luna"]);
   });
 });
 
@@ -2607,6 +2607,7 @@ test("diagnostic custody rejects dirty, stale and mismatched inputs before gener
   const binary = postilBinaryPath();
   const cliBinarySha256 = createHash("sha256").update(await readFile(binary)).digest("hex");
   const input = { binary, sourceSha, evaluatorSha256, cliBinarySha256, keyName: "POSTIL_API_KEY" };
+  const pricedModels = [...new Set([GENERATOR_MODEL, ...(await loadEmbeddedScorerDefaults()).qualification_candidates])];
   const keyPrevious = process.env.POSTIL_API_KEY;
   process.env.POSTIL_API_KEY = crypto.randomUUID();
   const dirty = await mkdtemp(join(tmpdir(), "postil-diagnostic-dirty-"));
@@ -2629,7 +2630,7 @@ test("diagnostic custody rejects dirty, stale and mismatched inputs before gener
       identityMode === "missingRecovered" && adjudicationCalls === 1);
     if (omitIdentity) identityFailures++;
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ...(omitIdentity ? {} : { model: GENERATOR_MODEL, provider: "Azure" }),
+    res.end(JSON.stringify({ ...(omitIdentity ? {} : { model: JSON.parse(body).model, provider: "Azure" }),
       choices: [{ finish_reason: "stop", message: { content: adjudication ?? JSON.stringify({
         scores: [{ confidence: 0.2, kind: "uncertainty", reason: "The claimed runtime break is unsupported by the change." }],
       }) } }], usage: { prompt_tokens: 30, completion_tokens: 10, cost: 0.000045 } }));
@@ -2639,9 +2640,9 @@ test("diagnostic custody rejects dirty, stale and mismatched inputs before gener
     const target = String(url);
     if (new URL(target).origin === "https://openrouter.ai" && new URL(target).pathname === "/api/v1/endpoints/zdr") {
       calls++; pricingCalls++;
-      return Response.json({ data: [{ model_id: GENERATOR_MODEL, provider_name: "Azure", tag: "azure/us", status: 0,
+      return Response.json({ data: pricedModels.map(model_id => ({ model_id, provider_name: "Azure", tag: "azure/us", status: 0,
         supported_parameters: ["max_tokens", "max_completion_tokens", "reasoning", "reasoning_effort", "temperature", "response_format", "structured_outputs"],
-        pricing: { prompt: "0.000001", completion: "0.000002" } }] });
+        pricing: { prompt: "0.000001", completion: "0.000002" } })) });
     }
     if (new URL(target).origin === "https://openrouter.ai" && new URL(target).pathname === "/api/v1/chat/completions") {
       calls++;
