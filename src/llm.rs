@@ -12805,11 +12805,11 @@ mod tests {
         }
 
         let config = Config {
-            model: "openai/gpt-5.6-luna".into(),
+            model: "openai/gpt-6-luna".into(),
             cascade: Vec::new(),
             consensus: 1,
             scorer_enabled: true,
-            scorer: "openai/gpt-5.6-luna".into(),
+            scorer: "openai/gpt-6-luna".into(),
             scorer_fallback: String::new(),
             api_base: "https://openrouter.ai:443/api/v1".into(),
             api_format: ApiFormat::OpenaiCompatible,
@@ -12825,7 +12825,7 @@ mod tests {
         )
         .unwrap();
         let body = client.request_body(
-            "openai/gpt-5.6-luna",
+            "openai/gpt-6-luna",
             "system",
             "user",
             100,
