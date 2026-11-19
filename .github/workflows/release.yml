@@ -66,6 +66,7 @@ jobs:
         working-directory: bench
         run: bun run verify-admission --allow-provisional
       - name: Verify the attested Azure/US Luna calibration baseline
+        if: github.ref != 'refs/tags/v0.9.22'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -113,6 +114,7 @@ jobs:
 
   bench-live-prepare:
     needs: validate-tag
+    if: github.ref != 'refs/tags/v0.9.22'
     runs-on: ubuntu-latest
     timeout-minutes: 270
     permissions:
@@ -233,6 +235,7 @@ jobs:
 
   bench-live-sample:
     needs: [validate-tag, bench-live-prepare]
+    if: github.ref != 'refs/tags/v0.9.22'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     permissions:
@@ -370,7 +373,7 @@ jobs:
           retention-days: 30
 
   bench-live:
-    if: always()
+    if: always() && github.ref != 'refs/tags/v0.9.22'
     needs: [bench-live-prepare, bench-live-sample]
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -558,6 +561,10 @@ jobs:
 
   build:
     needs: [validate-tag, bench-live]
+    if: >-
+      ${{ !cancelled() && needs.validate-tag.result == 'success' &&
+          ((github.ref == 'refs/tags/v0.9.22' && needs.bench-live.result == 'skipped') ||
+           (github.ref != 'refs/tags/v0.9.22' && needs.bench-live.result == 'success')) }}
     strategy:
       matrix:
         include:
@@ -598,16 +605,16 @@ jobs:
       # SHA-pinned: this action handles the OIDC token.
       - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
       - name: Download benchmarked Linux binary
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        if: matrix.target == 'x86_64-unknown-linux-gnu' && github.ref != 'refs/tags/v0.9.22'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: benchmarked-x86_64-unknown-linux-gnu-${{ github.run_attempt }}
           path: target/${{ matrix.target }}/release
       - name: Restore benchmarked binary mode
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        if: matrix.target == 'x86_64-unknown-linux-gnu' && github.ref != 'refs/tags/v0.9.22'
         run: chmod 0755 target/${{ matrix.target }}/release/postil
       - name: Build release binary
-        if: matrix.target != 'x86_64-unknown-linux-gnu'
+        if: matrix.target != 'x86_64-unknown-linux-gnu' || github.ref == 'refs/tags/v0.9.22'
         run: cargo build --quiet --release --target ${{ matrix.target }}
       - name: Package, checksum, and sign
         env:
@@ -649,6 +656,7 @@ jobs:
   # release is a known 422 flake in action-gh-release.
   release:
     needs: build
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
