@@ -1458,7 +1458,7 @@ describe("managed admission workflow", () => {
     const final = release.slice(finalStart, buildStart);
     const build = release.slice(buildStart);
 
-    expect(prepare).toMatch(/bench-live-prepare:\n\s+needs: validate-tag\n/u);
+    expect(prepare).toMatch(/bench-live-prepare:\n\s+needs: validate-tag\n\s+if: github\.ref != 'refs\/tags\/v0\.9\.22'\n/u);
     expect(prepare).toContain("name: benchmarked-x86_64-unknown-linux-gnu-${{ github.run_attempt }}");
     expect(prepare).toContain("path: target/release/postil");
     expect(prepare).toContain("bun run bench:cohort-create --");
@@ -1504,7 +1504,7 @@ describe("managed admission workflow", () => {
     );
 
     expect(final).toMatch(
-      /bench-live:\n\s+if: always\(\)\n\s+needs: \[bench-live-prepare, bench-live-sample\]/u,
+      /bench-live:\n\s+if: always\(\) && github\.ref != 'refs\/tags\/v0\.9\.22'\n\s+needs: \[bench-live-prepare, bench-live-sample\]/u,
     );
     expect(final).toMatch(
       /name: benchmarked-x86_64-unknown-linux-gnu-\$\{\{ github\.run_attempt \}\}\n\s+path: target\/release/u,
