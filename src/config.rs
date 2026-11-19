@@ -2716,7 +2716,7 @@ scorer = { enabled = true, default_model = "provider/scorer", reasoning_effort =
         let readme = include_str!("../README.md");
         assert!(readme.contains("docs/model-providers.md"));
         let provider_guide = include_str!("../docs/model-providers.md");
-        assert!(provider_guide.contains("openai/gpt-5.6-luna"));
+        assert!(provider_guide.contains("openai/gpt-6-luna"));
         assert!(provider_guide.contains("postil models"));
         assert!(provider_guide.contains("reasoning.effort"));
         assert!(provider_guide.contains("`minimal`"));
@@ -3921,15 +3921,15 @@ scorer = { enabled = true, default_model = "provider/scorer", reasoning_effort =
     #[test]
     fn hosted_candidate_matches_the_qualification_profile() {
         let defaults = model_defaults();
-        assert_eq!(defaults.default_model, "openai/gpt-5.6-luna");
+        assert_eq!(defaults.default_model, "openai/gpt-6-luna");
         assert!(defaults.cascade.is_empty());
         assert!(defaults.scorer_enabled);
-        assert_eq!(defaults.scorer_model, "openai/gpt-5.6-luna");
+        assert_eq!(defaults.scorer_model, "openai/gpt-6-luna");
         assert_eq!(defaults.scorer_reasoning_effort, ReasoningEffort::Low);
         assert!(defaults.scorer_fallback.is_empty());
         assert_eq!(
             defaults.scorer_qualification_candidates,
-            vec!["openai/gpt-5.6-luna"]
+            vec!["openai/gpt-6-luna"]
         );
     }
 
@@ -3979,13 +3979,13 @@ scorer = { enabled = true, default_model = "provider/scorer", reasoning_effort =
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         );
         assert_eq!(profile.upstream_provider_route, "azure/eu");
-        assert_eq!(profile.generator_chain, vec!["openai/gpt-5.6-luna"]);
-        assert_eq!(profile.scorer_chain, vec!["openai/gpt-5.6-luna"]);
+        assert_eq!(profile.generator_chain, vec!["openai/gpt-6-luna"]);
+        assert_eq!(profile.scorer_chain, vec!["openai/gpt-6-luna"]);
         assert_eq!(
             profile.provider_generation_models,
             std::collections::BTreeMap::from([(
-                "openai/gpt-5.6-luna".to_string(),
-                "openai/gpt-5.6-luna-20260709".to_string(),
+                "openai/gpt-6-luna".to_string(),
+                "openai/gpt-6-luna-20260922".to_string(),
             )])
         );
         let drifted = Config {
@@ -3997,7 +3997,7 @@ scorer = { enabled = true, default_model = "provider/scorer", reasoning_effort =
         assert_eq!(
             profile.model_price_bounds,
             vec![ModelPriceBound {
-                model: "openai/gpt-5.6-luna".to_string(),
+                model: "openai/gpt-6-luna".to_string(),
                 input_micros_per_million_tokens: 220_000,
                 output_micros_per_million_tokens: 1_320_000,
             }]
@@ -4149,7 +4149,7 @@ scorer = { enabled = true, default_model = "provider/scorer", reasoning_effort =
     fn provisional_hosted_profile_rejects_logical_provider_generation_aliases() {
         let mut profile: serde_json::Value = serde_json::from_str(PROVISIONAL_MODELS_JSON).unwrap();
         profile["providerGenerationModels"] = serde_json::json!({
-            "openai/gpt-5.6-luna": "openai/gpt-5.6-luna"
+            "openai/gpt-6-luna": "openai/gpt-6-luna"
         });
         assert!(
             parse_provisional_hosted_profile(&profile.to_string())

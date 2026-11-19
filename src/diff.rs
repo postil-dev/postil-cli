@@ -4116,11 +4116,22 @@ fn section_paths(section: &str, require_complete_hunks: bool) -> Result<SectionP
             !saw_hunk || (old_marker.is_some() && new_marker.is_some()),
             "diff section hunk has no file path marker pair"
         );
-        anyhow::ensure!(saw_change, "diff section has no complete change evidence");
     }
     match (&old_marker, &new_marker) {
         (None, None) | (Some(_), Some(_)) => {}
         _ => anyhow::bail!("diff section has an incomplete file path marker pair"),
+    }
+    if require_complete_hunks {
+        let marker_change = match (&old_marker, &new_marker) {
+            (Some(DiffMarkerPath::Null), Some(DiffMarkerPath::Path(_)))
+            | (Some(DiffMarkerPath::Path(_)), Some(DiffMarkerPath::Null)) => true,
+            (Some(DiffMarkerPath::Path(old)), Some(DiffMarkerPath::Path(new))) => old != new,
+            _ => false,
+        };
+        anyhow::ensure!(
+            saw_change || marker_change,
+            "diff section has no complete change evidence"
+        );
     }
     match (&rename_from, &rename_to) {
         (None, None) | (Some(_), Some(_)) => {}
@@ -7334,6 +7345,22 @@ diff --git a/src/multi.rs b/src/multi.rs
             );
             assert!(!parse(source).complete, "parsed {source}");
             assert!(prepare_diff(source).incomplete, "prepared {source}");
+        }
+    }
+
+    #[test]
+    fn marker_only_evidence_keeps_incomplete_or_conflicting_sections_closed() {
+        let cases = [
+            "diff --git a/src/a.rs b/src/a.rs\n",
+            "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n",
+            "diff --git a/src/a.rs b/src/a.rs\n--- /dev/null\n+++ /dev/null\n",
+            "diff --git a/src/a.rs b/src/b.rs\n--- a/src/other.rs\n+++ b/src/b.rs\n",
+            "diff --git a/src/a.rs b/src/b.rs\n--- a/src/a.rs\n+++ b/src/b.rs\n@@ -1 +1 @@\n-old\n",
+        ];
+        for source in cases {
+            let snapshot = DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+            assert!(prepare_review(&snapshot).is_err(), "accepted {source}");
+            assert!(!parse(source).complete, "parsed {source}");
         }
     }
 

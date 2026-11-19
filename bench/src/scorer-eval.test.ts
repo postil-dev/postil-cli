@@ -431,8 +431,8 @@ describe("parseModels", () => {
   test("uses the embedded Luna scorer qualification candidate", async () => {
     const defaults = await loadEmbeddedScorerDefaults();
     expect(defaults.enabled).toBe(true);
-    expect(defaults.qualification_candidates).toEqual(["openai/gpt-5.6-luna"]);
-    expect(parseModels(undefined, defaults.qualification_candidates)).toEqual(["openai/gpt-5.6-luna"]);
+    expect(defaults.qualification_candidates).toEqual(["openai/gpt-6-luna"]);
+    expect(parseModels(undefined, defaults.qualification_candidates)).toEqual(["openai/gpt-6-luna"]);
   });
 });
 

@@ -693,6 +693,7 @@ pub(crate) fn conservative_context_tokens(model: &str) -> usize {
         | "moonshotai/kimi-k2.7-code"
         | "openai/gpt-5-mini"
         | "openai/gpt-5.6-luna"
+        | "openai/gpt-6-luna"
         | "mistralai/mistral-small-3.2-24b-instruct" => 128_000,
         // Unknown BYOK endpoints get a conservative floor rather than an
         // optimistic provider-specific assumption.
@@ -7201,6 +7202,9 @@ mod tests {
             128_000
         );
         assert_eq!(conservative_context_tokens("openai/gpt-5-mini"), 128_000);
+        assert_eq!(conservative_context_tokens("openai/gpt-6-luna"), 128_000);
+        assert_eq!(conservative_context_tokens(" OPENAI/GPT-6-LUNA "), 128_000);
+        assert_eq!(conservative_context_tokens("openai/gpt-6-luna-spoof"), 32_000);
         assert_eq!(
             conservative_context_tokens("mistralai/mistral-small-3.2-24b-instruct"),
             128_000

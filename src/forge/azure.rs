@@ -892,6 +892,109 @@ mod tests {
     }
 
     #[test]
+    fn shared_writer_metadata_only_sections_prepare_with_all_paths() {
+        let cases = [
+            ("src/added.rs", "src/added.rs", "", "", true, false),
+            ("src/deleted.rs", "src/deleted.rs", "", "", false, true),
+            (
+                "src/old.rs",
+                "src/new.rs",
+                "unchanged\n",
+                "unchanged\n",
+                false,
+                false,
+            ),
+        ];
+        let mut source = String::new();
+        for (old_path, new_path, old, new, is_add, is_delete) in cases {
+            let section = diff_section(old_path, new_path, old, new, is_add, is_delete);
+            assert!(!section.contains("@@"), "expected marker-only section");
+            source.push_str(&section);
+        }
+        let snapshot = diff::DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+        let mut prepared = diff::prepare_review(&snapshot).unwrap();
+        assert!(prepared.index.is_complete());
+        assert!(prepared.has_source);
+        assert_eq!(
+            prepared.next_window().unwrap().as_deref(),
+            Some(source.as_str())
+        );
+        assert!(prepared.next_window().unwrap().is_none());
+        let parsed = diff::parse(&source);
+        assert!(parsed.complete);
+        assert_eq!(parsed.files.len(), cases.len());
+        for (file, (old_path, new_path, ..)) in parsed.files.iter().zip(cases) {
+            assert_eq!(file.old_path, old_path);
+            assert_eq!(file.path, new_path);
+        }
+    }
+
+    #[test]
+    fn generated_marker_sections_preserve_paths_and_reject_partial_reviews() {
+        let mut sections = Vec::new();
+        for path in ["src/plain.rs", "src/sp ace.rs", "src/quo\"te.rs"] {
+            for (old_path, new_path, old, new, add, delete) in [
+                (path, path, "", "", true, false),
+                (path, path, "", "", false, true),
+                (path, "src/new.rs", "same\n", "same\n", false, false),
+            ] {
+                let section = diff_section(old_path, new_path, old, new, add, delete);
+                assert!(!section.contains("@@"));
+                sections.push((section, old_path, new_path));
+            }
+        }
+        sections.push((
+            "diff --git a/src/old b/name.rs b/src/new b/name.rs\n--- a/src/old b/name.rs\n+++ b/src/new b/name.rs\n".to_string(),
+            "src/old b/name.rs",
+            "src/new b/name.rs",
+        ));
+        for shift in [0, 1, sections.len() - 1] {
+            let ordered = (0..sections.len())
+                .map(|i| &sections[(i + shift) % sections.len()])
+                .collect::<Vec<_>>();
+            let source = ordered
+                .iter()
+                .map(|entry| entry.0.as_str())
+                .collect::<String>();
+            let snapshot = diff::DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+            let mut prepared = diff::prepare_review(&snapshot).unwrap();
+            assert!(prepared.index.is_complete() && prepared.has_source);
+            assert_eq!(
+                prepared.next_window().unwrap().as_deref(),
+                Some(source.as_str())
+            );
+            let parsed = diff::parse(&source);
+            assert!(parsed.complete);
+            for (file, (_, old, new)) in parsed.files.iter().zip(ordered) {
+                assert_eq!((&*file.old_path, &*file.path), (*old, *new));
+            }
+            assert_eq!(parsed.files.len(), sections.len());
+        }
+
+        let prefix = diff_section("src/valid.rs", "src/valid.rs", "", "", true, false);
+        for path in ["src/plain.rs", "src/sp ace.rs", "src/quo\"te.rs"] {
+            let valid = diff_section(path, path, "", "", true, false);
+            let marker = format!("+++ {}", diff::display_path(&format!("b/{path}")));
+            for invalid in [
+                diff_section(path, path, "same\n", "same\n", false, false),
+                valid.replace(&marker, "+++ /dev/null"),
+                valid.replace(&marker, "+++ b/src/other.rs"),
+                valid.replace(&format!("{marker}\n"), ""),
+                format!("{valid}@@ -1 +1 @@\n-old\n"),
+            ] {
+                for source in [invalid.clone(), format!("{prefix}{invalid}")] {
+                    let snapshot = diff::DiffSnapshot::from_bytes(source.as_bytes()).unwrap();
+                    assert!(
+                        diff::prepare_review(&snapshot).is_err(),
+                        "accepted {source}"
+                    );
+                    assert!(!diff::parse(&source).complete, "parsed {source}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn added_file_uses_dev_null_base() {
         let section = unified_file_diff("new.rs", "new.rs", "", "a\nb\n", true, false);
         assert!(section.contains("--- /dev/null"));
