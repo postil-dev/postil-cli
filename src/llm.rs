@@ -7204,7 +7204,10 @@ mod tests {
         assert_eq!(conservative_context_tokens("openai/gpt-5-mini"), 128_000);
         assert_eq!(conservative_context_tokens("openai/gpt-6-luna"), 128_000);
         assert_eq!(conservative_context_tokens(" OPENAI/GPT-6-LUNA "), 128_000);
-        assert_eq!(conservative_context_tokens("openai/gpt-6-luna-spoof"), 32_000);
+        assert_eq!(
+            conservative_context_tokens("openai/gpt-6-luna-spoof"),
+            32_000
+        );
         assert_eq!(
             conservative_context_tokens("mistralai/mistral-small-3.2-24b-instruct"),
             128_000
