@@ -134,10 +134,16 @@ test("calibration workflow verifies retained provenance before reserving a chang
     steps.findIndex(step => step.name === "Reserve the current main calibration source"),
   );
   const directory = await fixture();
-  const baselinePath = resolve(directory, "bench/baseline-us.json");
+  const baselinePath = resolve(directory, "bench/baseline-gpt6-us.json");
+  const source = randomBytes(20).toString("hex");
+  const currentEvaluator = await evaluatorSourceSha256();
+  const baseline = {
+    corpus: { evaluatorSha256: randomBytes(32).toString("hex") },
+    profiles: { "openai/gpt-6-luna": { populated: true, calibration: { sourceSha: source } } },
+  };
+  await writeFile(baselinePath, JSON.stringify(baseline));
   const baselineBytes = await readFile(baselinePath);
-  const baseline = JSON.parse(baselineBytes.toString());
-  const source = baseline.profiles["openai/gpt-5.6-luna"].calibration.sourceSha;
+  await writeFile(resolve(directory, "bench/baseline-gpt6-us.attestation.json"), JSON.stringify({ synthetic: true }));
   const bin = resolve(directory, "bin");
   await mkdir(bin);
   const callsPath = resolve(directory, "calls");
@@ -157,7 +163,6 @@ else
 fi
 `);
   await chmod(shim, 0o700);
-  const currentEvaluator = await evaluatorSourceSha256();
   const run = async (options: Record<string, string> = {}) => {
     await writeFile(callsPath, "");
     const child = Bun.spawn(["bash", "-c", initial + "\n(\n" + validation + "\n)\n" + reservation], {
@@ -180,7 +185,7 @@ fi
   expect(accepted.code).toBe(0);
   const verification = accepted.calls.find(args => args[0] === "attestation")!;
   expect(verification).toEqual([
-    "attestation", "verify", "bench/baseline-us.json", "--bundle", "bench/baseline-us.attestation.json",
+    "attestation", "verify", "bench/baseline-gpt6-us.json", "--bundle", "bench/baseline-gpt6-us.attestation.json",
     "--repo", "postil-dev/postil-cli", "--signer-workflow", "postil-dev/postil-cli/.github/workflows/benchmark-calibration.yml",
     "--signer-digest", source, "--source-digest", source, "--source-ref", "refs/heads/main",
     "--cert-oidc-issuer", "https://token.actions.githubusercontent.com", "--predicate-type", "https://slsa.dev/provenance/v1",
@@ -205,8 +210,8 @@ fi
   expect((await run({ RESERVATION_EXIT: "1" })).code).not.toBe(0);
   for (const update of [
     { profiles: {} },
-    { profiles: { "openai/gpt-5.6-luna": { populated: "false" } } },
-    { profiles: { "openai/gpt-5.6-luna": { populated: true, calibration: { sourceSha: "invalid" } } } },
+    { profiles: { "openai/gpt-6-luna": { populated: "false" } } },
+    { profiles: { "openai/gpt-6-luna": { populated: true, calibration: { sourceSha: "invalid" } } } },
     { ...baseline, corpus: { evaluatorSha256: "invalid" } },
   ]) {
     await writeFile(baselinePath, JSON.stringify(update));
@@ -215,11 +220,11 @@ fi
     expect(refused.calls.some(args => args.includes("POST"))).toBe(false);
   }
   await writeFile(baselinePath, baselineBytes);
-  await writeFile(resolve(directory, "bench/baseline-us.attestation.json"), "");
+  await writeFile(resolve(directory, "bench/baseline-gpt6-us.attestation.json"), "");
   const missingBundle = await run();
   expect(missingBundle.output).toContain("requires the retained baseline attestation");
   expect(missingBundle.calls.some(args => args.includes("POST"))).toBe(false);
-  await writeFile(baselinePath, JSON.stringify({ profiles: { "openai/gpt-5.6-luna": { populated: false } } }));
+  await writeFile(baselinePath, JSON.stringify({ profiles: { "openai/gpt-6-luna": { populated: false } } }));
   const bootstrap = await run();
   expect(bootstrap.code).toBe(0);
   expect(bootstrap.calls.some(args => args[0] === "attestation")).toBe(false);

@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 2,
+  "corpus": {
+    "fixtureCorpusSha256": "3a53ed4b0967c275cd47eb7633a4b56c94be1fdd2bd69bde0fc3eb77562c4924",
+    "evaluatorSha256": "d92d1824de9c10fccd27b948e4e45b35d4406d5d219894cacdbd21ea4a9eee0b"
+  },
+  "profiles": {
+    "openai/gpt-6-luna": {
+      "populated": false,
+      "instructions": "Run the existing benchmark-calibration workflow from current main on its first attempt. Import its attested, predeclared ten-slot calibration baseline and bundle in a later change before release."
+    }
+  }
+}

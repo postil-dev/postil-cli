@@ -44,6 +44,7 @@ import {
 import {
   formatCanonicalDecimal,
   parseCanonicalDecimal,
+  providerContractEvidence,
   providerContractSha256,
   sumCanonicalDecimals,
   type ProviderContractEvidence,
@@ -101,22 +102,22 @@ test("release prerequisite rejects an unpopulated US baseline before attestation
   try {
     await mkdir(resolve(directory, "bench"));
     const check = async (): Promise<{ code: number; output: string }> => {
-      const child = Bun.spawn(["bash", "-c", 'set -euo pipefail\nprofile="openai/gpt-5.6-luna"\n' + prerequisite], {
+      const child = Bun.spawn(["bash", "-c", 'set -euo pipefail\nprofile="openai/gpt-6-luna"\n' + prerequisite], {
         cwd: directory, stdout: "pipe", stderr: "pipe", timeout: 10_000,
       });
       const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
       return { code, output: stdout + stderr };
     };
-    const baseline = (populated: boolean) => JSON.stringify({ profiles: { "openai/gpt-5.6-luna": { populated } } });
-    await writeFile(resolve(directory, "bench/baseline-us.json"), baseline(false));
+    const baseline = (populated: boolean) => JSON.stringify({ profiles: { "openai/gpt-6-luna": { populated } } });
+    await writeFile(resolve(directory, "bench/baseline-gpt6-us.json"), baseline(false));
     const missing = await check();
     expect(missing.code).toBe(1);
     expect(missing.output).toContain("New releases require the populated Azure/US baseline");
-    await writeFile(resolve(directory, "bench/baseline-us.attestation.json"), JSON.stringify({ fixture: true }));
+    await writeFile(resolve(directory, "bench/baseline-gpt6-us.attestation.json"), JSON.stringify({ fixture: true }));
     expect((await check()).code).toBe(1);
-    await writeFile(resolve(directory, "bench/baseline-us.json"), baseline(true));
+    await writeFile(resolve(directory, "bench/baseline-gpt6-us.json"), baseline(true));
     expect((await check()).code).toBe(0);
-    await writeFile(resolve(directory, "bench/baseline-us.attestation.json"), "");
+    await writeFile(resolve(directory, "bench/baseline-gpt6-us.attestation.json"), "");
     expect((await check()).code).toBe(1);
     expect(workflow.indexOf("gh attestation verify", end)).toBeGreaterThan(end);
   } finally {
@@ -146,8 +147,20 @@ test("retained attested US calibration binds its source and route while the embe
   expect(usBaselineProfile.calibration.reportCount).toBe(10);
   expect(() => assertBaselineCalibrationIntegrity(usBaselineProfile)).not.toThrow();
   expect(usBaselineProfile.calibration.sourceSha).toMatch(/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/u);
-  expect(usBaselineProfile.screeningProfileSha256).toBe(us.sha256);
-  expect(usBaselineProfile.calibration.providerContractSha256).toBe(us.providerContractSha256);
+  const historicalProfileBytes = historicalArtifact("provisional-models-us.json");
+  const historicalProfile = JSON.parse(historicalProfileBytes);
+  const historicalContract = providerContractEvidence(
+    historicalProfile.upstreamProviderIdentity,
+    historicalProfile.upstreamProviderRoute,
+    new Map(historicalProfile.modelPriceBounds.map((bound: {
+      model: string; inputMicrosPerMillionTokens: number; outputMicrosPerMillionTokens: number;
+    }) => [bound.model, bound])),
+    historicalProfile.generatorChain,
+    historicalProfile.scorerChain,
+  );
+  expect(usBaselineProfile.screeningProfileSha256).toBe(createHash("sha256").update(historicalProfileBytes).digest("hex"));
+  expect(usBaselineProfile.calibration.providerContractSha256).toBe(providerContractSha256(historicalContract));
+  expect(usBaselineProfile.screeningProfileSha256).not.toBe(us.sha256);
   expect(usBaselineProfile.upstreamProviderIdentity).toBe("Azure");
   const attestation = JSON.parse(attestationBytes);
   expect(attestation.mediaType).toBe("application/vnd.dev.sigstore.bundle.v0.3+json");
@@ -361,6 +374,7 @@ async function inputBoundReport(screeningProfilePath = resolve(import.meta.dir, 
     screeningProfileMetadata(screeningProfilePath),
   ]);
   Object.assign(report.summary, {
+    model: profile.providerContract.modelPriceBounds.find(bound => bound.roles.includes("generator"))!.model,
     binarySha256: createHash("sha256").update(binary).digest("hex"),
     fixtureCorpusSha256: createHash("sha256")
       .update(JSON.stringify(parsedCases))
@@ -1126,6 +1140,7 @@ describe("three-report aggregation compatibility", () => {
     const reports = Array.from({ length: 5 }, () => {
       const report = fakeReport();
       Object.assign(report.summary, {
+        model: us.providerContract.modelPriceBounds.find(bound => bound.roles.includes("generator"))!.model,
         screeningProfileSha256: us.sha256,
         upstreamProviderRoute: us.upstreamProviderRoute,
         providerContract: us.providerContract,

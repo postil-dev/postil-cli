@@ -70,15 +70,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          profile="openai/gpt-5.6-luna"
+          profile="openai/gpt-6-luna"
           jq -e --arg profile "$profile" '.profiles[$profile].populated == true' \
-            bench/baseline-us.json >/dev/null && test -s bench/baseline-us.attestation.json || {
+            bench/baseline-gpt6-us.json >/dev/null && test -s bench/baseline-gpt6-us.attestation.json || {
             echo "::error::New releases require the populated Azure/US baseline and its main-branch first-attempt calibration attestation."
             exit 1
           }
           source_sha="$(jq -er --arg profile "$profile" \
             '.profiles[$profile] | select(.populated == true) | .calibration.sourceSha' \
-            bench/baseline-us.json)"
+            bench/baseline-gpt6-us.json)"
           [[ "$source_sha" =~ ^[0-9a-f]{40,64}$ ]] || {
             echo "::error::The Luna baseline has an invalid calibration source digest."
             exit 1
@@ -90,8 +90,8 @@ jobs:
             echo "::error::The Luna baseline source is not protected by the calibration registry."
             exit 1
           }
-          gh attestation verify bench/baseline-us.json \
-            --bundle bench/baseline-us.attestation.json \
+          gh attestation verify bench/baseline-gpt6-us.json \
+            --bundle bench/baseline-gpt6-us.attestation.json \
             --repo postil-dev/postil-cli \
             --signer-workflow postil-dev/postil-cli/.github/workflows/benchmark-calibration.yml \
             --signer-digest "$source_sha" \
@@ -531,7 +531,7 @@ jobs:
           set -euo pipefail
           comparison=0
           bun run bench:compare -- \
-            --baseline baseline-us.json \
+            --baseline baseline-gpt6-us.json \
             --binary "${{ github.workspace }}/target/release/postil" \
             --screen-profile ../provisional-models-us.json \
             --cohort-manifest "${{ runner.temp }}/bench-live-cohort.json" \
